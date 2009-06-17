@@ -1,0 +1,3117 @@
+<?php
+// $Id$
+
+/**
+ * @file
+ * Enables the comms module wich creates a new content type that will hold 
+ * communications data which can then be searched, moderated, and dispatched
+ * in a number of different fashions.
+ *
+ * This module is for Drupal 5.x only.
+ *
+ * Some notes on modifying this file:
+ * a) before checking into the repo make sure you do a checkout first and 
+ *    merge any changes
+ *
+ * b) make liberal use of the watchdog() function in your code 
+ *    (http://api.drupal.org/api/function/watchdog/5)
+ *
+ * c) When working with debug values, use this form:
+ *   0 - no messages
+ *   1 - function tracing w/ simple argument dump (no arrays, objects, or long texts)
+ *   2 - undefined
+ *   3 - function tracing w/ argument dump
+ *   4 - undefined
+ *   5 - undefined
+ *
+ * d) When making twitter api calls make sure that the twitter_api_calls
+ *    table is updated with comms_add_twitter_api_call().  We use this so that
+ *    we can monitor our rate usage.
+ *
+ * TODO: start integrating in simple test : http://drupal.org/project/simpletest
+ * TODO: write dispatch functionality
+      there are two ways we will dispatch something:
+      1) If the dispatch button is pressed - check!
+      2) If the dispatch level for a node is reached, after voting - check!
+      3) A user with points greater then comms_dispatchlevel submits a comms node - test
+      4) test without a net connection.
+ * TODO: theme any user interface that refers to the comms data type to use
+      the system wide configured name.
+ * TODO: groups should have free tagging keywords that specify the interests 
+      of their groups
+ */
+
+/*****************************/
+/* HOOK_* AND CORE FUNCTIONS */
+/*****************************/
+
+function comms_init() {
+  // views_menu is executed
+  if (module_exists('views')) {
+    include_once('./'. drupal_get_path('module', 'comms') .'/comms_views.inc');
+  }
+}
+
+
+function comms_node_info() {
+   return array(
+      'comms' => array(
+      'name' => t('Comms'),
+      'module' => 'comms',
+      'description' => t("Create communications data."),
+    )
+  );
+}
+
+function comms_perm() {
+    return array(
+      "add comms data", 
+      "edit comms data", 
+      "edit own comms data", 
+      "vote comms data", 
+      "has operator view",
+      "has admin view");
+}
+
+//we can automatically add the users points to the node vote on submit here
+//we can automatically dispatch here as well if the user has enough points
+function comms_insert($node) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_insert()');
+  }
+
+  if (! ($result = db_query("INSERT INTO {comms_additions} (nid, sms_message) VALUES (%d, '%s')", 
+    $node->nid, $node->sms_message))) {
+    watchdog('comms', t('Could not insert the sms message, source, or tmid into db for node->nid: @nid', array('@nid' => $node->nid)));
+  } 
+      
+  $vote->value = userpoints_get_current_points($node->uid);
+  //at this point there are no groups associated with the node
+  //so we can't dispatch the node yet
+  
+  //if the user has 0 points there is no sence in casting a vote
+  if ($vote->value != 0) {
+    $vote->value_type = 'points';
+    $vote->tag = 'vote';
+    $result = votingapi_set_vote('comms', $node->nid, $vote, $node->uid);
+  }
+    
+}
+
+//we need to update the sms message if it is set
+function comms_update($node) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_update()');
+  } 
+
+  //check to see if a row for this node has been added
+  $query = 'SELECT * from {comms_additions} WHERE nid=%d';
+  if (! ($result = db_query_range($query, $node->nid, 0, 1))) {
+    //Note that for mysql this will return a numeric value, pgsql a string
+    watchdog("comms_group", t("There was a problem selecting from comms_additions. Error: %db_error", 
+      array('%db_error' => db_error())));
+    drupal_set_message(t("There is a database problem.  Your sms message was not set for this data.  Have one of the admins check the logs."));
+    return;
+  }
+
+  if (db_num_rows($result) < 1) {
+    comms_insert($node);
+  } 
+  else {
+
+    //update the sms message
+    if (! db_query("UPDATE {comms_additions} set sms_message='%s' WHERE nid=%d",
+      $node->sms_message, $node->nid)) {
+      //Note that for mysql this will return a numeric value, pgsql a string
+      watchdog("comms", t("There was a problem updating the comms_additions table with nid=@nid. Error: %db_error", 
+        array('@nid' => $node->nid, '%db_error' => db_error())));
+    }//if
+  }//else
+}
+
+//this does not delete votes associated with nodes, because they really belong
+//to the users
+function comms_delete($node) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message("comms_delete()");
+  }
+
+  if (! ($result = db_query('DELETE from {comms_additions} WHERE nid=%d', $node->nid ) ) ) {
+    //Note that for mysql this will return a numeric value, pgsql a string
+    watchdog("comms_group", t("There was a problem deleting a row from comms_additions with nid:@nid. Error: %db_error",  
+      array('@nid' => $node->nid, '%db_error' => db_error())));
+    drupal_set_message(t("There is a database problem. Have one of the admins check the logs."));
+    return;
+  }
+
+}
+
+function comms_nodeapi(&$node, $op, $teaser = NULL, $page = NULL) {
+  global $user;
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message("comms_nodeapi()");
+  }
+
+  if ($node->type == 'group') {
+    drupal_add_css(drupal_get_path('module', 'comms') .'/comms_group.css', 'module', 'all', TRUE);
+  } 
+  else if ($node->type == 'comms') {
+    drupal_add_css(drupal_get_path('module', 'comms') .'/comms.css', 'module', 'all', TRUE);
+  }
+
+  //lets handle the validation for group nodes to make sure that all 
+  //that twiiter shit is valid
+  if ($node->type == 'group' && $op == 'validate') {
+    comms_group_form_validate($node);
+    return;
+  }
+
+  //the associated twitter data validated and now we insert it into the db
+  if ($node->type == 'group' && $op == 'insert') {
+    comms_group_form_insert($node);
+    return;
+  }
+
+  //the associated twitter data validated and now we insert it into the db
+  if ($node->type == 'group' && $op == 'update') {
+    comms_group_form_update($node);
+    return;
+  }
+  
+  //the associated twitter data validated and now we insert it into the db
+  if ($node->type == 'group' && $op == 'view') {
+    comms_group_view($node);
+    return;
+  }
+  
+  //the associated twitter data validated and now we insert it into the db
+  if ($node->type == 'group' && $op == 'delete') {
+    comms_group_delete($node);
+    return;
+  }
+  
+}
+
+//TODO: as far as I can tell this is the best place to add specific dispatching scenarios
+//- when a node is added and a users points is already >= dispatchlevel
+//- when a node has already been dispatched and new groups are added to the node (this is the
+//same as a group being added to the node when vote is >= dispatchlevel)
+function comms_load($node) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_load()');
+  }
+
+  $additions = db_fetch_object(
+    db_query('SELECT `sms_message` FROM {comms_additions} WHERE `nid` = %d', $node->nid));
+
+  return $additions;
+}
+
+function comms_help($section = NULL) {
+   switch ($section) {
+      case 'admin/help#comms':
+      $output = '<p>'. t('The comms module can be used to help organize data for a comunications team.  Incoming data can be associated with different groups which members can subscribe to.') .'</p>';      
+
+      $output = '<p>'. t('This module was developed by the !hbteam<p>', array(
+        '!hbteam' => l('hackbloc team', 'http://hackbloc.org') ));
+   return $output;
+   break;
+   }
+}
+
+//creates a block of all comms nodes
+function comms_block($op = 'list', $delta = 0, $edit = array()) {
+  switch ($op) {
+  case 'list' :
+    $blocks[0]['info'] = t("Comms");
+    return $blocks;
+
+  case 'configure':
+    
+    if ($delta == 0) {
+      $form['comms_block_count'] = array(
+        '#type' => 'textfield',
+        '#title' => 'Count',
+        '#size' => 4,
+        '#description' => 'Number of nodes to show, 0 will show all',
+        '#default_value' => variable_get('comms_block_count', '0'),
+      );
+    }
+    return $form;
+
+  case 'save':
+    if ($delta == 0) {
+      // Have Drupal save the string to the database.
+      variable_set('comms_block_count', $edit['comms_block_count']);
+    }
+    return;
+    
+  case 'view': default:
+    $block['subject'] = t('Comms');
+    // The content of the block is typically generated by calling a custom
+    // function.
+    $block['content'] = comms_block_contents();
+    return $block;
+  }
+}
+
+//this supplies the contents of the comms block.
+//Namely all of the comms nodes
+function comms_block_contents() {
+  //2008-08-26, evoltech: this query makes sure that we do not pull
+  //anything that has already been dispatched, is not enabled, or is
+  //not a comms node
+  //2008-10-21, evoltech: verified that this is valid pgsql/mysql sql
+  $count = variable_get('comms_block_count', 0);
+  $sql = "SELECT * FROM {node} AS n WHERE (n.type = 'comms') AND (n.status = 1) AND (n.nid NOT IN (SELECT nid from {comms_group_dispatch})) ORDER BY nid DESC";
+  if ($count > 0) {
+    $result = db_query_range($sql, 0, $count);
+  } 
+  else {
+    $result = db_query($sql);
+  }
+
+  while ($node = db_fetch_object($result)) {
+    
+    $node->sms_message = comms_load($node);
+    $node = node_prepare($node);
+    $node = comms_view($node);
+    $build .= node_view($node);
+
+  }
+  return $build;
+}
+
+//responsible for overriding different forms in the
+//drupal system
+function comms_form_alter($form_id, &$form) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message("comms_form_alter()");
+  }
+   
+  switch ($form_id) {
+    case 'group_node_form':
+      comms_group_form_alter($form);
+      break;
+    default:
+  }//switch
+
+}//hook_form_alter
+
+//responsible for responding to different submits on the site
+function comms_submit($form_id, &$form = NULL) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message("comms_submit()");
+  }
+}
+
+function comms_form(&$node) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message("comms_form()");
+  }
+  
+  $type = node_get_types('type', $node);
+
+   // We need to define form elements for the node's title and body.
+   $form['title'] = array(
+      '#type' => 'textfield',
+      '#title' => check_plain($type->title_label),
+      '#required' => TRUE,
+      '#default_value' => $node->title,
+      '#weight' => -5
+   );
+   
+  $form['sms_message'] = array(
+    '#type' => 'textfield',
+    '#maxlength' => 140,
+    '#title' => t('SMS Message'),
+    '#default_value' => check_plain($node->sms_message),
+    '#required' => FALSE
+  );
+
+   // We want the body and filter elements to be adjacent. We could try doing
+   // this by setting their weights, but another module might add elements to the
+   // form with the same weights and end up between ours. By putting them into a
+   // sub-array together, we're able force them to be rendered together.
+   $form['body_filter']['body'] = array(
+      '#type' => 'textarea',
+      '#title' => check_plain($type->body_label),
+      '#default_value' => $node->body,
+      '#required' => FALSE
+  );
+
+   return $form;
+}
+
+function comms_access($op, $node) {
+  global $user;
+
+   if ($op == 'create') {
+      // Only users with permission to do so may create this node type.
+      return user_access('add comms data');
+   }
+
+   // Users who create a node may edit or delete it later, assuming they have the
+   // necessary permissions.
+   if ($op == 'update' || $op == 'delete') {
+      if (user_access('edit own comms data') && ($user->uid == $node->uid)) {
+         return TRUE;
+      } 
+      else {
+       return user_access('edit comms data');
+      }//else
+  }//if
+
+}//comms_access
+
+/* this gives us a list of all comms nodes and their nids, shamefully stolen from og */
+//2008-08-26, evoltech: implemented cacheing for this query ala:
+//http://www.lullabot.com/articles/a_beginners_guide_to_caching_data
+function comms_all_nodes_options($nid_omit=NULL, $reset=NULL) {
+  //2008-08-26, evoltech: this query makes sure that we do not pull
+  //anything that has already been dispatched, is not enabled, or is
+  //not a comms node
+  //2008-10-21, evoltech: verified this is valid pgsql/mysql sql
+  $sql = "SELECT n.title, n.nid FROM {node} n WHERE (n.type = 'comms') AND (n.status = 1) AND (n.nid NOT IN (SELECT nid from {comms_group_dispatch}))";
+  if (is_numeric($nid_omit)) {
+    $sql .= " AND (n.nid != $nid_omit)";
+  }
+  $sql .= " ORDER BY n.title ASC";
+  $result = db_query($sql);
+  while ($row = db_fetch_object($result)) {
+    $options[$row->nid] = $row->title;
+  }
+  return $options ? $options : array();
+}
+
+/* hook_user() : http://api.drupal.org/api/function/hook_user/5
+ * we use this to make sure all users have at least one point when
+ * they are created
+ */
+function comms_user($op, $edit, $account, $category = NULL) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message("comms_user()");
+  }
+  
+  switch ($op) {
+  //"insert": The user account is being added. The module should save 
+  //its custom additions to the user object into the database and set 
+  //the saved fields to NULL in $edit. 
+  case 'insert':
+    $param = array(
+      'points' => 1,
+      'uid' => $account->uid
+    );  
+    userpoints_userpointsapi($param);
+    break;
+  }//switch
+
+}
+
+/*****************************/
+/* COMS DISPLAY FUNCTIONS */
+/*****************************/
+
+//this is where we should implement the following requirement: http://rnc08coms.hackbloc.org/node/45
+//TODO: how do you use the theming functions here?
+//TODO: also make sure that the use has permission to see the vote form
+function comms_view($node, $teaser = FALSE, $page = FALSE) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message("comms_view()");
+  }
+  
+  $node = node_prepare($node, $teaser);
+
+  $node->content['comms_sms_message'] = array(
+    '#value' => theme('comms_sms_message', 
+    comms_get_sms_message($node->nid))
+  );
+
+  //include a node delete form button
+  $node->content['comms_delete'] = array(
+    '#weight' => 3,
+    '#value' => theme('comms_delete',
+      l('Delete', "node/$node->nid/delete", NULL, drupal_get_destination()))
+  );
+
+  //function that will generate the themed section that holds
+  //the Rating, Groups, Dispatch section of a comms node
+  //this shit should not even get displayed if the node has already been 
+  //dispatched
+  $node->content['rgd_section'] = array(
+    '#value' => create_rgd_section($node)
+  );
+
+  return $node;
+
+}
+
+/*****************************/
+/* COMS ADMIN FORM FUNCTIONS */
+/*****************************/
+
+function comms_admin_twitterAPI() {
+  $default_collection_method = '';
+  if (variable_get('comms_searchalltweets', 0)) {
+    $default_collection_method = 0;
+  }
+  else if (variable_get('comms_addfromgetfollowers', 0)) {
+    $default_collection_method = 1;
+  }
+
+  $form['comms_collection_method'] = array(
+    '#type' => 'radios',
+    '#title' => t('Comms collection method'),
+    '#options' => array(t('Search All Tweets'), t('Add From getFollowers()')),
+    '#default_value' => $default_collection_method,
+    '#description' => t("There are two main collection methods for twitter content.  The first, <strong>search all tweets</strong>, uses the").  
+      l(t("twitter search API"), 'http://search.twitter.com/api') .
+      t(" to collect data from followers of groups with assigned twitter accounts. The second is to collect posts from the status returned as we poll for new followers for each group.  This may be usefull if the twitter search index is back logged."),
+  );
+  
+  $form['comms_twitterAPI_path'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Twitter API Path'),
+    '#default_value' => variable_get('comms_twitterAPI_path', 
+    drupal_get_path('module', 'comms') .'/Arc90_Service_Twitter/lib/Arc90/Service'),
+    '#description' => t("The path to the Arc90 Twitter API library. For example: 'modules/comms/Arc90_Service_Twitter/lib/Arc90/Service'"),
+    '#after_build' => array('_audio_twitterAPI_settings_check_path'),
+  );
+
+  $form['audio_getid3_version'] = array(
+    '#type' => 'item',
+    '#title' => t('Include Check'),
+  );
+  if (comms_twitterAPI_isfound() &&
+    preg_match('/Arc90_Service_Twitter Object/', 
+    print_r(_comms_twitterAPI_load(), 1))) {
+    $form['audio_getid3_version']['#value'] = 'Included';
+    $form['audio_getid3_version']['#description'] = 
+      t("If you're seeing this it indicates that the Twitter API library was found.");
+  }//if
+  else {
+    $form['audio_getid3_version']['#value'] = 'NOT Included';
+    $form['audio_getid3_version']['#description'] = 
+      t("The Twitter API library was not included.");
+  }
+
+  return system_settings_form($form);
+}
+
+function comms_admin() {
+
+
+  $form['comms_debuglevel'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Comms module debug level'),
+    '#default_value' => variable_get('comms_debuglevel', 0),
+    '#size' => 2,
+    '#maxlength' => 2,
+    '#description' => t("Comms Debug Level")
+  ); 
+
+  $form['comms_dispatchlevel'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Rating to dispatch info at'),
+    '#default_value' => variable_get('comms_dispatchlevel', 5),
+    '#size' => 2,
+    '#maxlength' => 2,
+    '#description' => t("The rating at which to dispatch a piece of info at")
+  );
+
+  $form['comms_actionname'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Comms action name'),
+    '#default_value' => variable_get('comms_actionname', "comms"),
+    '#size' => 25,
+    '#maxlength' => 25,
+    '#description' => t("The name of the action")
+  );
+
+  return system_settings_form($form);
+}
+
+//this should be used to validate anything that can be changed in the 
+//comms_admin form. Drupal checks all input, but it is a good idea to
+//provide additional checks, cause, ya know hackers and stuff
+function comms_admin_validate($node, &$form) {
+   $dispatchlevel = $form['comms_dispatchlevel'];
+   if (!is_numeric($dispatchlevel)) {
+      form_set_error('comms_dispatchlevel', t('You must select a number for the dispatch level.'));
+   }
+   else if ($dispatchlevel < 1) {
+      form_set_error('comms_dispatchlevel', t('Minimum dispatch level must be positive.'));
+   }
+   else if ($dispatchlevel > 10) {
+      form_set_error('comms_dispatchlevel', t('Maximum dispatch level must be less then or equal to 10.'));
+  }
+
+   $actionname = $form['comms_actionname'];
+   if (!is_string($actionname)) {
+      form_set_error('comms_actionname', t('The action name must be a string.'));
+   }
+   else if (strlen($actionname) < 4) {
+      form_set_error('comms_actionname', t('The action name must be between 4 and 25 characters.'));
+   }
+   else if (strlen($actionname) > 25) {
+      form_set_error('comms_actionname', t('The action name must be between 4 and 25 characters.'));
+    
+   }
+  
+  $debuglevel = $form['comms_debuglevel'];
+   if (!is_numeric($debuglevel)) {
+      form_set_error('comms_debuglevel', t('You must select a number for the debug level.'));
+   }
+   else if ($debuglevel < 0) {
+      form_set_error('comms_debuglevel', t('Minimum debug level must at least zero.'));
+   }
+   else if ($debuglevel > 10) {
+      form_set_error('comms_debuglevel', t('Maximum debug level must be less then or equal to 10.'));
+  }
+
+}
+
+function comms_admin_submit($form_id, $node) {
+  if ($node['comms_collection_method']) {
+    variable_set('comms_searchalltweets', 0);
+    variable_set('comms_addfromgetfollowers', 1);
+  }
+  else {
+    variable_set('comms_searchalltweets', 1);
+    variable_set('comms_addfromgetfollowers', 0);
+  }
+}//comms_admin_submit
+
+
+//hook_forms
+//this will act as a dispatcher for all comms_vote forms when they are displayed
+//as a list.  Niether of the forms validate or submit functions are getting called???
+function comms_forms() {
+  $args = func_get_args();
+
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message("comms_forms()");
+  }
+
+  //handle the voteing forms
+  if (strpos($args[0][0], 'comms_vote') !== FALSE) {
+    if ($args[0][0] == 'comms_vote_'. $args[0][1] .'_'. $args[0][2]) {
+      $forms[$args[0][0]] = array('callback' => 'comms_vote');
+      return $forms;
+    }
+  }
+  //handle the dispatching forms
+  else if (strpos($args[0][0], 'comms_dispatch') !== FALSE) {
+    if ($args[0][0] == 'comms_dispatch_'. $args[0][1] .'_'. $args[0][2]) {
+      $forms[$args[0][0]] = array('callback' => 'comms_dispatch');
+      return $forms;
+    }
+  }
+  //handle the groups forms
+  else if (strpos($args[0][0], 'comms_groups') !== FALSE) {
+    if ($args[0][0] == 'comms_groups_'. $args[0][1] .'_'. $args[0][2]) {
+      $forms[$args[0][0]] = array('callback' => 'comms_groups');
+      return $forms;
+    }
+  }
+  //handle the deduplication forms
+  else if (strpos($args[0][0], 'comms_dedup') !== FALSE) {
+    if ($args[0][0] == 'comms_dedup_'. $args[0][1] .'_'. $args[0][2]) {
+      $forms[$args[0][0]] = array('callback' => 'comms_dedup');
+      return $forms;
+    }
+  }
+  //handle the priority forms
+  else if (strpos($args[0][0], 'comms_priority') !== FALSE) {
+    if ($args[0][0] == 'comms_priority_'. $args[0][1] .'_'. $args[0][2]) {
+      $forms[$args[0][0]] = array('callback' => 'comms_priority');
+      return $forms;
+    }
+  }
+}
+
+/********************************/
+/* COMMS PRIORITY FORM FUNCTIONS */
+/********************************/
+function comms_priority($content_type, $content_id) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message("comms_priority()");
+  }
+  
+  if (user_access('edit comms data')) {
+    $form['#base'] = 'comms_priority_'. $content_type .'_'. $content_id;  
+    $form['#theme'] = 'comms_priority';  
+
+    $default_value = array_keys(taxonomy_node_get_terms($content_id));
+    $form['comms_priority'] = taxonomy_form(1, $default_value[0]);
+
+    $form['comms_priority_submit'] = array(
+      '#id' => 'comms_priority_submit_'. $content_id,
+      '#type' => 'submit',
+      '#value' => 'Update Priority'
+    );
+
+    //this is some ninja shit here.  For an explanation of why we need to
+    //use #submit see: http://tinyurl.com/472gcp
+    $form['#submit']  = array(
+      'comms_priority_submit' => array());
+
+    $form['#validate']  = array(
+      'comms_priority_validate' => array());
+  }//if
+  return $form;
+}
+
+function comms_priority_validate($form_id, $form_values=NULL, $form=NULL) {
+  //make sure we have form values
+  if (is_null($form_values)) {
+    form_set_error('comms_priority_submit', 'You have sumbitted invalid data');
+  }
+
+  if (!preg_match('/(\d+)$/', $form_id)) {
+    form_set_error('comms_priority_submit', 'You have sumbitted invalid data');
+  }
+}
+
+function comms_priority_submit($form_id, &$form) {
+  if (preg_match('/(\d+)$/', $form_id, $matches)) {
+    taxonomy_node_save($matches[1], array($form['comms_priority']));
+  }
+}
+
+/*****************************/
+/* COMS VOTE FORM FUNCTIONS */
+/*****************************/
+
+//This will contain all the form data for casting a vote on a piece of 
+//information.  These have to be of type 'submit' instead of 'button' so that
+//the comms_vote_submit gets called when they are pressed
+//drupal 5.x form api docs: http://api.drupal.org/api/file/developer/topics/forms_api_reference.html/5
+//TODO: we could do some fancy stuff here like only displaying one of the
+//buttons if a user already voted
+function comms_vote($content_type, $content_id) {
+  global $user;
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message("comms_vote()");
+  }
+  
+  static $js_added = FALSE;
+  if (!$js_added) {
+    drupal_add_js(drupal_get_path('module', 'comms') .'/js/comms.js');
+    $js_added = TRUE;
+  }//if
+
+  //get a list of all votes indexed by user that cast them
+  //for some reason $content_type here is always $node ???
+  $votes = votingapi_get_content_votes('comms', $content_id);
+  
+  $form['#theme'] = 'comms_vote';
+  
+  $form['content_type'] = array(
+    '#type' => 'hidden',
+    '#value' => $content_type,
+    '#id' => $content_id ? 'edit-content-type-'. $content_id : NULL,
+    '#prefix' => '<div id="comms_vote" class="comms-form-item">',
+  );
+
+  //2008-08-29, evoltech: it was decided that users should vote multiple times
+  //we do not list include the form for users who have already voted
+  //or who are not permitted to vote
+  if (
+    user_access('vote comms data')
+  ) {
+    $form['comms_vote_select'] = array(
+     '#type' => 'select',
+     '#options' => array(
+       '1' => '/'. drupal_get_path('module', 'comms') .'/plus1.jpg',
+       '-1' => '/'. drupal_get_path('module', 'comms') .'/minus1.jpg',
+       ),
+     '#id' => 'edit-comms-vote-'. $content_id,
+    );
+
+    $form['auto_submit_path'] = array(
+      '#type' => 'hidden',
+      '#value' => url('comms/vote/comms/'. $content_id),
+      '#id' => 'edit-auto-submit-path-'. $content_id,
+      '#attributes' => array('class' => 'comms-vote-path'),
+    );
+  }//if
+    
+  $form['content_id'] = array(
+    '#type' => 'hidden',
+    '#value' => $content_id,
+    '#id' => $content_id ? 'edit-content-id-'. $content_id : NULL,
+  );
+
+  $result = votingapi_get_voting_results('comms', $content_id);
+  $vote_ct = $result[2]->value;
+  $point_ct = $result[1]->value;
+
+  if (is_array($votes) && count($votes) > 0) {
+    $total_vote = "<label>". t("Rating") 
+      .":</label> <div class=\"value\">$point_ct</div>";
+  }
+  else {
+    $total_vote = "<label>". t("Rating") 
+      .":</label> <div class=\"value\">0</div>"; 
+  }
+  
+  //the #prefix here should really be done in a theming form, 
+  //but I can't seem to get it working
+  $form['destination'] = array(
+    '#type' => 'hidden',
+    '#value' => $_GET['q'], 
+    '#id' => isset($content_id) ? 'edit-destination-'. $content_id : NULL,
+    '#prefix' => '<div class="comms-vote-summary" id="comms-vote-summary-'. $content_id .'">'. 
+      $total_vote .'</div>',
+    '#suffix' => '</div>'
+  );
+
+  return $form;
+}
+
+//This function will be called whenever one of the vote buttons from the 
+//comms_vote form are pressed.  A vote is placed by a user of the system
+//most likely an operator, it should not be confused with the initial
+//vote value of a user contributing a piece of information, which can
+//be added to another node if the two pieces are concatenated
+function comms_vote_validate($node, &$form) {
+  //Votes are 1 or -1, but we recieve it from the form as a string, so we have
+  //to type cast it first
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message("comms_vote_validate()");
+  }
+  
+  $vote = (int)$form['op'];
+  if ($vote != -1 && $vote != 1) {
+      form_set_error('comms_vote', t('There was a illegal vote cast. Votes are +1 or -1.'));
+      watchdog('comms_vote', t("There was a illegal vote cast. Votes are +1 or -1."));
+  } 
+}
+
+//Not sure that this can be done like this
+function comms_comms_vote($form) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message("comms_comms_vote()");
+  }
+  $output = '<div class="comms_vote_form">';
+  $output .= drupal_render($form);
+  $output .= '</div>';
+  return $output;
+}
+
+//this will return some xml for the client side js
+function comms_vote_execute($type, $cid, $value, $tag = 'vote', $ignore_user=FALSE, $rval='xml') {
+   global $user;
+
+  $user_message = '';
+  $dont_query = 0;
+  $dont_vote = 0;
+
+   //make sure this is a comms node
+  $node = node_load($cid);
+  $type = $node->type;
+  if ($type != "comms") {
+    watchdog("comms_vote", t("attempting to execute comms vote for a non comms node type"));
+    $user_message .= t("You tried to vote for a invalid node type.") ."<br />";
+    $dont_query = 1;
+  }
+
+  //only logged in users can vote
+  if (!isset($uid)) {
+    if ($user->uid) {
+      $uid = $user->uid;
+    }
+    else {
+      watchdog("comms_vote", t("attempting to cast a vote for anonomous user"));
+      $user_message .= t('Only !userlink users can vote', 
+        array('!userlink' => l('logged in', 'user')));
+      $dont_vote = 1;
+    }
+  }
+
+  if ($ignore_user) 
+    $uid = NULL;
+
+  //if $value is passed in as a string we need to convert it
+  if (is_string($value)) {
+    $value = (int)$value;
+  }
+
+  if (!is_numeric($cid)) {
+    watchdog("comms_vote", t("attempting to cast a vote for a non-numeric cid"));
+    $user_message .= t('You tried to vote on an invalid node') .'.<br />';
+    $dont_query = 1;
+  }
+
+  if ($value != 1 && $value != -1 && !$ignore_user) {
+    watchdog("comms_vote", t("attempting to cast a vote for an invalid value: %value", array('%value' => $value)));
+    $user_message .= t('You tried to cast an invalid vote') .'.<br />';
+    $dont_vote = 1;
+  }
+
+  if (!$dont_vote && !$dont_query) {
+    $ballot->value = $value;
+    $ballot->value_type = 'points';
+    $ballot->tag = 'vote';
+
+    //2008-08-31, evoltech: we are now saying that multiple votes should be able 
+    //to be cast.  We are recieving the vote object cast here not the vote result
+    //we want to make sure that if this vote will put us over the dispatch level
+    //then we need to not increase the vote unless the dispatch succeeds
+    $vote = votingapi_get_voting_results($type, $cid);
+    if ($value + $vote[1]->value >= variable_get('comms_dispatchlevel', 5)) {
+      $message = comms_group_dispatch_validate($node);
+      if ($message != 1) {
+        $user_message .= $message; 
+      }
+      else {
+        $message = comms_group_dispatch($node);
+        if ($message != 1) {
+          $user_message .= $message; 
+        }
+        else {
+          $user_message .= t('Dispatched!') .'<br />';
+          $vote_cast = votingapi_add_vote($type, $cid, $value, 'points', 'vote', $uid);
+          $vote = votingapi_recalculate_results($type, $cid);
+        }//else
+      }//else
+    }
+    else {
+      $vote_cast = votingapi_add_vote($type, $cid, $value, 'points', 'vote', $uid);
+      $vote = votingapi_recalculate_results($type, $cid);
+    }
+      
+  }//if
+  else {
+    watchdog("comms_vote", t("we could not vote"));
+  }
+
+  if (!$dont_query) {  
+    $result = votingapi_get_voting_results($type, $cid);
+    $votes = votingapi_get_content_votes($type, $cid); 
+
+    $sum = $result[1]->value;
+    $count = $result[2]->value;
+  }
+
+   if (count($result)) {
+     foreach ($result as $data) {
+       if ($data->tag == $tag) {
+         $output .= '<'. $data->function .'>'. $data->value .'</'. $data->function .'>';
+         $summary[$data->tag][$data->function] = $data->value;
+       }//if
+     }//foreach
+  }//if
+
+  $output = '';
+  $output .= '<?xml version="1.0" encoding="UTF-8"?>';
+  $output .= '<xml>';
+  if (!$dont_query) {
+    $output .= '<result><summary>';
+    $output .= '<count>'. $count .  '</count>';
+
+    $output .= '<sum>'.  $sum .'</sum>';
+
+    $output .= '<voters>';
+    foreach (array_keys($votes) as $voter) {
+      $output .= '<voter><path>'. url("user/$voter") .'</path>';
+      $output .= '<username>'. uid_to_username($voter) . 
+      '('. 
+      userpoints_get_current_points($voter) .
+      ')'.
+        '</username></voter>';
+    }
+    $output .= '</voters>';
+
+    $output .= '</summary>';
+    $output .= '</result>';
+  }//!$dont_query
+  
+  //if (!$dont_vote) {
+    $output .= '<vote>';
+    $output .= '<value>'. $value .'</value>';
+    $output .= '<type>'. $type .'</type>';
+    $output .= '<id>'. $cid .'</id>';
+    $output .= '</vote>';
+  //}
+    
+    if (variable_get('comms_debuglevel', 0) > 0) {
+      $output .= '<debug>'. print_r($votes, 1) .'</debug>';
+    }
+
+    $output .= '<debug_dont_vote>'. $dont_vote .'</debug_dont_vote>';
+    $output .= '<debug_dont_query>'. $dont_query .'</debug_dont_query>';
+    $output .= '<user_message>'.  $user_message .'</user_message>';
+    $output .= '<params>'.  'rval: '. $rval .' user: '. $ignore_user .'</params>';
+  $output .= '</xml>';
+    if ($rval == 'xml') {
+      drupal_set_header("Content-Type: text/xml");
+      exit($output);
+    }
+    else {
+      return ( $user_message ." ". $value ." ". t("user") .": ". $uid );
+    }
+} 
+
+/***************************************/
+/* COMS DE-DUPLICATE FORM FUNCTIONS    */
+/***************************************/
+
+// This contains all the logic for creating a form for users
+// to report a duplicate node, the node is removed and then 
+// the points for that node are given to the node it is a duplicate of
+
+function comms_dedup($content_type, $content_id) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_dedup()');
+  }
+  
+
+  //we do not list include the form for those who are not 
+  //able to edit comms data
+  if (user_access('edit comms data')) {
+    $form['#base'] = 'comms_dedup_'. $content_type .'_'. $content_id;  
+    $form['#theme'] = 'comms_dedup';  
+ 
+    
+      $form['comms_dedup_duplicate_nodeid'] = array(
+        '#id' => 'comms_dedup_nodeid_'. $content_id,
+        '#type' => 'hidden',
+        '#value' => $content_id
+      );
+
+      $form['comms_dedup_good_nodeid'] = array(
+        '#id' => 'comms_dedup_good_nodeid_'. $content_id,
+        '#type' => 'select',
+        '#title' => t('This is a duplicate of:'),
+        '#multiple' => FALSE,
+        '#attributes' => array('class' => 'comms_dedup'),
+        '#default_value' => t('Select duplicate node...'),
+        '#options' => comms_all_nodes_options($content_id)
+      );
+
+      $form['comms_dedup_submit'] = array(
+        '#id' => 'comms_dedup_submit_'. $content_id,
+        '#type' => 'submit',
+        '#value' => t('Deduplicate node')
+      );
+
+      //this is some ninja shit here.  For an explanation of why we need to
+      //use #submit see: http://tinyurl.com/472gcp
+      $form['#submit']  = array(
+        'comms_dedup_submit' => array());
+      
+      $form['#validate']  = array(
+        'comms_dedup_validate' => array());
+  } //if
+  return $form;
+} // end deduping form functions
+
+function comms_dedup_validate($form_id, $form_values=NULL, $form=NULL) {
+  
+
+  //make sure we have form values
+  if (is_null($form_values)) {
+    form_set_error('comms_dedup_submit', 
+      t('You have sumbitted invalid data for deduplication form_values'));
+    return;
+  }
+
+  //make sure that the values are numeric and exist
+  if (!isset($form_values['comms_dedup_duplicate_nodeid']) 
+      || !isset($form_values['comms_dedup_good_nodeid'])
+      || !is_numeric($form_values['comms_dedup_duplicate_nodeid']) 
+      || !is_numeric($form_values['comms_dedup_good_nodeid']) ) {
+        form_set_error('comms_dedup_submit', 
+          t('You have sumbitted invalid data for deduplication'));
+        return;
+      }
+
+  //at least they are real nodes so lets load the fuckers
+  $dupe_node = node_load($form_values['comms_dedup_duplicate_nodeid']);
+  $good_node = node_load($form_values['comms_dedup_good_nodeid']);
+  if ($dupe_node->type != 'comms' || $good_node->type != 'comms') {
+    form_set_error('comms_dedup_submit', 
+      t('You have sumbitted invalid data for deduplication. One of these things is not like the other.'));
+    return;
+  }
+
+  //lets also check that the node we hope to be jumping onto has a sms field 
+  //and an associated group if the combined vote will be > comms_dispatchlevel
+  $dupe_node_rate = votingapi_get_voting_results('comms', $dupe_node->nid);
+  $dupe_node_rate = $dupe_node_rate[1]->value;
+  
+  $good_node_rate = votingapi_get_voting_results('comms', $good_node->nid);
+  $good_node_rate = $good_node_rate[1]->value;
+  if ($good_node_rate + $dupe_node_rate >=
+    variable_get('comms_dispatchlevel', 0)) {
+
+    if (is_null($good_node->sms_message) || $good_node->sms_message == '') {
+      form_set_error('comms_dedup_submit', 
+        t("This operation will cause the dispatching of") 
+        .'"<strong>'.
+        $good_node->title 
+        .'</strong>"'.
+        t("but it does not have a sms message to dispatch."));
+    }
+
+    $asc_groups = module_invoke('og', 'get_node_groups', $good_node);
+    if (!is_array($asc_groups) || count($asc_groups) == 0) {
+      form_set_error('comms_dedup_submit', 
+        t("This operation will cause the dispatching of")
+        ." \"<strong>".
+        $good_node->title 
+        ."</strong>\"".
+        t("but it does not have any groups to dispatch to."));
+    }
+  }//if
+
+  // if we hit here then we now definitely have a comms node that is good to go.
+  return;
+}
+
+function comms_dedup_submit($form_id, &$form) {
+  $dupe_node = node_load($form['comms_dedup_duplicate_nodeid']);
+  $good_node = node_load($form['comms_dedup_good_nodeid']);
+  
+  //this next function returns an array matching votingapi_vote records for the nid we specify
+  $dnode_votes = votingapi_get_content_votes('comms', $dupe_node->nid);
+  $gnode_votes =  votingapi_get_content_votes('comms', $dupe_node->nid);
+  foreach ($dnode_votes as $dvuid) {
+    $duid = $dvuid[0]->uid;
+    $dvalue = $dvuid[0]->value;
+    
+    //delete all votes for duplicate content
+    if (isset($gnode_votes[$duid])) {
+      votingapi_unset_vote("comms", $gnode_votes[$duid][0]->content_id, $duid);
+    }
+
+    //add the old votes to the new node.
+    $beep = votingapi_add_vote("comms", $good_node->nid, $dvalue, 'points', 'vote', $duid);
+  }
+
+  // we have to do this to update the votingapi_cache table
+  votingapi_recalculate_results("comms", $good_node->nid, TRUE);
+
+  //if we have enough votes to dispatch we should do it now
+  //hyper on red jarito!
+  $rate = votingapi_get_voting_results('comms', $good_node->nid);
+  $rate = $rate[1]->value;
+  if ($rate >= variable_get('comms_dispatchlevel', 0)) {
+    $arg['comms_dispatch_nodeid'] = $good_node->nid;
+    $message = comms_group_dispatch($good_node);
+    drupal_set_message(
+      t("Dispatched") ." \"<strong>". 
+      check_plain($good_node->title) ."</strong>\": ".
+      $message);
+  }//if
+
+  // now  we take care of the groups 
+  $dupe_node_groups = module_invoke('og', 'get_node_groups', $dupe_node);
+
+  foreach ($dupe_node_groups as $gid => $v) {
+    $good_node->og_groups[] = $gid;
+  }
+  // and save our changes
+  og_save_ancestry($good_node);
+
+  $dupe_node->status = 0;
+  node_save($dupe_node);
+}
+
+/***************************************/
+/* COMS SEARCH FORM FUNCTIONS          */
+/***************************************/
+
+//then we want to see if we can check the search results and generate the view dynamically
+//check $form_values or $_POST['edit']
+//TODO: this is a total hack ... there has to be a correct way to do this
+function comms_search() {
+  $return = drupal_get_form('comms_search_page');
+  
+  
+  if ($_SESSION['comms']['submit'] == 1) {
+    $timeframe = (isset($_SESSION['comms']['timeframe']) &&  
+      $_SESSION['comms']['timeframe'] != '') ? 
+      $_SESSION['comms']['timeframe'] : 'All';
+
+    $rating = (isset($_SESSION['comms']['rating']) && 
+      $_SESSION['comms']['rating'] != '') ? 
+      $_SESSION['comms']['rating'] : 'All';
+
+    $dispatched = 'not';
+    //we check to see if either they are both set or if they are not set, I know its funky
+    //maybe there is a better way to do this
+    if (
+      (strcmp($_SESSION['comms']['dispatched']['dispatched'], 'dispatched') == 0 &&
+      strcmp($_SESSION['comms']['dispatched']['notdispatched'], 'notdispatched') == 0) ||
+      
+      ($_SESSION['comms']['dispatched']['notdispatched'] === 0 &&
+      $_SESSION['comms']['dispatched']['dispatched'] === 0 ) 
+    ) {
+      $dispatched = 'All';
+    }
+    else if (strcmp($_SESSION['comms']['dispatched']['dispatched'], 'dispatched') == 0) { 
+      $dispatched = '1';
+    } 
+
+    $categorized = 'not';
+    //we check to see if either they are both set or if they are not set, I know its funky
+    //maybe there is a better way to do this
+    //This is not working correctly
+    if (
+      (strcmp($_SESSION['comms']['categorized']['categorized'], 'categorized') == 0 &&
+      strcmp($_SESSION['comms']['categorized']['notcategorized'], 'notcategorized') == 0) ||
+      
+      ($_SESSION['comms']['categorized']['notcategorized'] === 0 &&
+      $_SESSION['comms']['categorized']['categorized'] === 0 ) 
+    ) {
+      $categorized = 'All';
+    }
+    else if (strcmp($_SESSION['comms']['categorized']['categorized'], 'categorized') == 0) { 
+      $categorized = '1';
+    } 
+
+    $args = array($timeframe, $rating, $dispatched, $categorized);
+
+    if ($_SESSION['comms']['urgency']['name']) {
+      $args[] = $_SESSION['comms']['urgency']['name'];
+    }
+
+    if ($_SESSION['comms']['display']) {
+      $view = views_get_view('comms_slim');
+    }
+    else {
+      $view = views_get_view('comms_full');
+    }
+
+    $return .= views_build_view('page', $view, $args, $view->use_pager, $view->nodes_per_page, 0, 0, NULL);
+  }//if
+  return $return;
+}
+
+function comms_search_page() {
+  //we want to generate the forms
+  //time frame - should be in minutes
+  $form['timeframe'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Minutes since intel was received'),
+    '#default_value' => isset($_SESSION['comms']['timeframe']) ? $_SESSION['comms']['timeframe'] : t('All'),
+    '#size' => 5,
+    '#maxlength' => 5,
+    '#description' => t('Specify the time frame since the data was recieved'),
+  );
+
+  //dispatched - binary value
+  $form['dispatched'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Dispatched?'),
+    '#options' => array(
+      'notdispatched' => t('Not Dispatched'), 
+      'dispatched' => t('Dispatched')
+    ),
+    '#description' => t('Specify weather or not you want to search for dispatched nodes only'),
+    '#default_value' => isset($_SESSION['comms']['dispatched']) ? 
+      $_SESSION['comms']['dispatched'] : array('dispatched', 'notdispatched'),
+  );
+
+  //rating - should be 1 - max
+  $form['rating'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Current vote value'),
+    '#default_value' => isset($_SESSION['comms']['rating']) ? $_SESSION['comms']['rating'] : '',
+    '#size' => 3,
+    '#maxlength' => 3,
+    '#description' => t('Filter the intel by its vote value'),
+  );
+
+  // 
+  $form['categorized'] = array(
+    '#type' => 'checkboxes',
+    '#title' => t('Categorized'),
+    '#options' => array(
+      'notcategorized' => t('Not categorized'),
+      'categorized' => t('Categorized'),
+      ),
+    '#default_value' => isset($_SESSION['comms']['categorized']) ? $_SESSION['comms']['categorized'] : '',
+    '#description' => t('Show only content that has a been categorized.  Note that checking "Not categorized" is an easy way to see all new nodes'),
+  );
+
+  //urgency
+  //TODO: this needs to be a look up by the vocabulary name
+  $form['urgency'] = taxonomy_form(1);
+  $form['urgency']['#weight'] = 1;
+  $form['urgency']['#default_value'] = $_SESSION['comms']['urgency']['tid'] ?
+    $_SESSION['comms']['urgency']['tid'] : '';
+  
+  $form['display'] = array(
+    '#type' => 'radios',
+    '#title' => t('Display Option'),
+    '#options' => array(
+      t('Full'), 
+      t('Slim')
+    ),
+    '#description' => t('Specify the format of the display you would like'),
+    '#default_value' => isset($_SESSION['comms']['display']) ? 
+      $_SESSION['comms']['display'] : 0,
+  );
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Search'),
+    '#weight' => 2
+  );
+
+  return $form;
+}
+
+function comms_search_page_validate($form_id, $form_values) {
+  //timeframe, dispatched, rating
+  if (strtolower($form_values['timeframe']) != 'all' &&
+    $form_values['timeframe'] != '') {
+    if ( $form_values['timeframe'] < 1 ||
+      $form_values['timeframe'] > 7*24*60 ) {
+        form_set_error('timeframe', t('You must either leave this field blank or specify a time in minutes between 0 and 10080.'));
+    }
+  }
+
+  if ($form_values['rating'] < 0 ||
+    $form_values['rating'] > variable_get('comms_dispatchlevel', 5)) {
+      form_set_error('rating', 
+        t('You must specify a rating between 0 and !dispatchlevel.', 
+        array('!dispatchlevel' => variable_get('comms_dispatchlevel', 5))));
+  }
+}
+
+//TODO: fix this scary hack!
+function comms_search_page_submit($form_id, $form_values) {
+  $_SESSION['comms']['submit'] = 1;
+  
+  if (isset($form_values['timeframe'])) {
+    $_SESSION['comms']['timeframe'] = $form_values['timeframe']; 
+  }
+  else{
+    unset($_SESSION['comms']['timeframe']);
+  }
+      
+  //TODO: the correct value needs to get passed into the $_SESSION
+  if (isset($form_values['dispatched'])) {
+    $_SESSION['comms']['dispatched'] = $form_values['dispatched']; 
+  }
+  else{
+    unset($_SESSION['comms']['dispatched']);
+  }
+
+  if (isset($form_values['categorized'])) {
+    $_SESSION['comms']['categorized'] = $form_values['categorized']; 
+  }
+  else{
+    unset($_SESSION['comms']['categorized']);
+  }
+      
+  if (isset($form_values['rating'])) {
+    $_SESSION['comms']['rating'] = $form_values['rating']; 
+  }
+  else {
+    unset($_SESSION['comms']['rating']);
+  }
+
+  if (isset($form_values['display'])) {
+    $_SESSION['comms']['display'] = $form_values['display']; 
+  }
+  else {
+    unset($_SESSION['comms']['display']);
+  }
+
+  if (isset($form_values['urgency']) && is_numeric($form_values['urgency'])) {
+    $urgency = taxonomy_get_term($form_values['urgency']);
+    $_SESSION['comms']['urgency']['name'] = $urgency->name;
+    $_SESSION['comms']['urgency']['tid'] = $urgency->tid;
+  }
+  else {
+    unset($_SESSION['comms']['urgency']);
+  }
+}
+
+/***************************************/
+/* COMS VERIFY/DISPATCH FORM FUNCTIONS */
+/***************************************/
+
+//This will contain all the form data for verifying/dispatching a piece of 
+//information.  
+//drupal 5.x form api docs: http://api.drupal.org/api/file/developer/topics/forms_api_reference.html/5
+function comms_dispatch($content_type, $content_id) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_dispatch()');
+  }
+
+  //we do not list include the form for those who are not 
+  //able to edit comms data
+  if (user_access('edit comms data')) {
+    $form['#base'] = 'comms_dispatch_'. $content_type .'_'. $content_id;  
+    $form['#theme'] = 'comms_dispatch';
+
+    $form['comms_dispatch_nodeid'] = array(
+      '#id' => 'comms_dispatch_nodeid_'. $content_id,
+      '#type' => 'hidden',
+      '#value' => $content_id
+    );
+
+    $form['comms_dispatch_submit'] = array(
+      '#id' => 'comms_dispatch_submit_'. $content_id,
+      '#type' => 'submit',
+      '#value' => t('Verify/Dispatch'),
+      '#attributes' => array('class' => 'comms_dispatch'),
+    );
+    
+    //this is some ninja shit here.  For an explanation of why we need to
+    //use #submit see: http://tinyurl.com/472gcp
+    $form['#submit']  = array(
+      'comms_dispatch_submit' => array());
+    
+    $form['#validate']  = array(
+      'comms_dispatch_validate' => array());
+  }//if
+    
+  return $form;
+}
+
+//this should verify that we have a sms message and a node-id
+function comms_dispatch_validate($form_id, $form_values = NULL, $form = NULL) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_dispatch_validate()');
+  }
+
+  if (is_null($form_values) || 
+    !isset($form_values['comms_dispatch_nodeid']) || 
+    !is_numeric($form_values['comms_dispatch_nodeid'])) {
+      form_set_error('comms_dispatch_submit', 
+        t("You atempted to dispatch an invalid comms node."));
+      return;
+  }
+  
+  $node = node_load($form_values['comms_dispatch_nodeid']);
+
+  //TODO: we need to check that this is a comms node, but I am still not sure 
+  //why
+  if ($node->type != 'comms') {
+    form_set_error('comms_dispatch_submit', 
+      t('You have sumbitted invalid data for dispatch.'));
+    return;
+  }
+  
+  //we need to check that the node we are dispatching for
+  //has a sms message
+  $sms_message = comms_get_sms_message($node->nid);
+  if (strlen($sms_message) == 0) {
+    form_set_error('comms_dispatch_submit',
+      t('There is no sms message for this node.'));
+    return;
+  }
+  
+  //we need to check that the node we are dispatching for
+  //has groups.
+  //there can either be an empty return value or an empty array
+  //on an error condition
+  $node_groups = module_invoke('og', 'get_node_groups', $node);
+  if (is_null($node_groups) || count($node_groups) == 0) {
+    form_set_error('comms_dispatch_submit',
+      t('There are no groups associated with this node to dispatch to.'));
+    return;
+  }
+
+  //we need to check that if there are groups that they actually have a 
+  //twitter account.  A group without a twitter account should never 
+  //happen, unless the site is in a wierd state
+  foreach (array_keys($node_groups) as $gid) {
+    $account = comms_get_group_twitter_account($gid);
+    if (!is_array($account) || count($account) == 0) {
+      form_set_error('comms_dispatch_submit',
+        t('Trying to dispatch to group %group but there is no twitter account associated with it.', array('%group' => $node_groups[$gid])));
+      return;
+    }
+  }
+
+  //we need to check that if there are groups that there is at least one
+  //that has not been dispatched yet
+  //NOTE|BUG:  This really only shows if this node has been dispatched to at least
+  //one group, not all groups.  Is this a bug?
+  $all_dispatched = 1;
+  foreach (array_keys($node_groups) as $gid) {
+    
+    //we only want to dispatch to nodes that have not been dispatched to yet
+    //we know there exists some node because comms_submit_validate checks
+    if (!$result = db_query("SELECT dispatch_time from {comms_group_dispatch} WHERE nid=%d AND gid=%d", $node->nid, $gid)) {
+      watchdog("comms_group", 
+        t("Unable to select from the comms_group_dispatch table with nid=@nid and gid=@gid", 
+        array('@nid' => $node->nid, '@gid' => $gid)));
+      form_set_error('comms_dispatch_submit', 
+        t('we are unable to process this dispatch request because there is a problem the database.  Please contact an admin and try again later'));
+
+      return;
+    }//if
+    else if (db_num_rows($result) == 0) {
+      $all_dispatched = 0;
+      break;
+    }//else
+  }//foreach
+
+  if ($all_dispatch) {
+    form_set_error('comms_dispatch_submit', 
+      t('All groups associated with this node have already been disatched to.'));
+    return;
+  }//if
+}//comms_dispatch_validate
+
+//we should hit this if the Verify/Dispatch button is pressed
+function comms_dispatch_submit($form_id, &$form) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_dispatch_submit()');
+  }
+
+  $node = node_load($form['comms_dispatch_nodeid']);
+
+  //we already verified that this exists in comms_dispatch_submit
+  $sms_message = comms_get_sms_message($node->nid);
+  $node_groups = module_invoke('og', 'get_node_groups', $node);
+
+  $message = comms_group_dispatch($node);
+    form_set_error('comms_dispatch_submit', $message);
+  if ($message != 1) {
+    form_set_error('comms_dispatch_submit', $message);
+  }
+}//comms_dispatch_submit
+
+/***************************************/
+/* COMS GROUPS FORM FUNCTIONS          */
+/* these will have to be submitted via */
+/* javascript                          */
+/***************************************/
+
+//This will contain all the form data for verifying/dispatching a piece of 
+//information.  
+//drupal 5.x form api docs: http://api.drupal.org/api/file/developer/topics/forms_api_reference.html/5
+//NOTE: this could be caled in preview, so we might not have $content_id
+function comms_groups($content_type, $content_id) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_groups()');
+  }
+  
+  if ($content_id) {
+    $node = node_load($content_id);
+    $node_groups = module_invoke('og', 'get_node_groups', $node);
+
+    //we do not list include the form for those who are not 
+    //able to edit comms data
+    if (user_access('edit comms data')) {
+      $form['#base'] = 'comms_groups_'. $content_type .'_'. $content_id;  
+      $form['#theme'] = 'comms_groups_form';  
+
+      $form['comms_groups_nodeid'] = array(
+        '#id' => 'comms_groups_nodeid_'. $content_id,
+        '#type' => 'hidden',
+        '#value' => $content_id
+      );
+
+      $form['comms_groups'] = array(
+        '#id' => 'comms_groups_'. $content_id,
+        '#type' => 'select',
+        '#size' => 3,
+        '#title' => t('Groups'),
+        '#multiple' => TRUE,
+        '#attributes' => array('class' => 'comms_groups'),
+        '#default_value' => array_keys(module_invoke('og', 'get_node_groups', $node)),
+        '#options' => module_invoke('og', 'all_groups_options')
+      );
+
+      $form['comms_groups_submit'] = array(
+        '#id' => 'comms_group_submit_'. $content_id,
+        '#type' => 'submit',
+        '#value' => t('Update Groups'),
+        '#attributes' => array('class' => 'comms_group_submit')
+      );
+
+      //this is some ninja shit here.  For an explanation of why we need to
+      //use #submit see: http://tinyurl.com/472gcp
+      $form['#submit']  = array(
+        'comms_groups_submit' => array());
+      
+      $form['#validate']  = array(
+        'comms_groups_validate' => array());
+    }//if
+  }//if
+  else {
+    return; 
+  }
+    
+  return $form;
+}
+
+//if this is getting set with ajax the validate and submit functions will 
+//never get called.  There isn't really anything to validate here.
+function comms_groups_validate($form_id, $form_values = NULL, $form) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_groups_validate()');
+  }
+
+}
+
+function comms_groups_submit($form_id, &$form) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_groups_submit()');
+  }
+
+  if (isset($form['comms_groups'])) {
+    $node = node_load($form['comms_groups_nodeid']);
+    $node->og_groups = array();
+    foreach ($form['comms_groups'] as $gid) {
+      $node->og_groups[] = $gid;
+    }
+
+    //we need to find all the groups that are different
+    og_save_ancestry($node);
+  }//if
+}
+
+/*****************************/
+/* COMS MENU FUNCTIONS */
+/*****************************/
+
+/**
+ * Implementation of hook_menu().
+ */
+function comms_menu($may_cache) {
+  $items = array();
+
+  if ($may_cache) {
+    $items[] = array(
+      'path' => 'admin/settings/comms',
+      'title' => t('Comms module settings'),
+      'description' => t('Site wide settings for the comms module'),
+      'callback' => 'drupal_get_form',
+      'callback arguments' => 'comms_admin',
+      'access' => user_access('access administration pages'),
+      'type' => MENU_NORMAL_ITEM
+    );
+    
+    $items[] = array(
+      'path' => 'admin/settings/comms/main', 'title' => t('Comms'),
+      'callback' => 'drupal_get_form',
+      'callback arguments' => array('comms_admin'),
+      'type' => MENU_DEFAULT_LOCAL_TASK,
+      'weight' => '-10',
+    );
+
+    $items[] = array(
+      'path' => 'admin/settings/comms/twitterAPI',
+      'title' => t('Comms Twitter API settings'),
+      'description' => t('Site wide Twitter API settings for the comms module'),
+      'callback' => 'drupal_get_form',
+      'callback arguments' => 'comms_admin_twitterAPI',
+      'access' => user_access('access administration pages'),
+      'type' => MENU_LOCAL_TASK
+    );
+
+    $items[] = array(
+      'path' => 'comms/vote',
+      'callback' => 'comms_vote_execute',
+      'type' => MENU_CALLBACK,
+      'access' => user_access('vote comms data'),
+    );
+
+    $items[] = array(
+      'path' => 'comms/groups',
+      'callback' => 'comms_groups_execute',
+      'type' => MENU_CALLBACK,
+      'access' => user_access('edit comms data'),
+    );
+
+    if (module_exists('views')) {
+      $items[] = array(
+        'path' => 'comms/search',
+        'callback' => 'comms_search',
+        'type' => MENU_CALLBACK,
+        'access' => user_access('access content'),
+      );
+    }//if
+  }//if
+
+  return $items;
+}
+
+/*************************************/
+/* COMS GROUP FUNCTIONS aka OG HOOKS */
+/*************************************/
+//responsible for overriding the group_form this is for form specific 
+//issues like making this a multiple page submit form, not for changing
+//the way content is displayed.
+//Override: 
+function comms_group_form_alter(&$form_values) {
+  global $user;
+
+  // In a multistep form, drupal_get_form() will always
+  // pass the incoming form values to you after any other
+  // parameters that you specify manually. Do this instead
+  // of looking at the incoming $_POST variable manually.
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_group_form_alter()');
+  }
+
+  if (user_access('has operator view') && 
+    $user->uid != 1 &&
+    array_search('site admin', $user->roles) === FALSE) {
+  
+    //we don't want to see the og membership selection fields
+    //0 = open - membership requests are accepted immediately.
+    //TODO: on submission make sure this gets updated in og.selective
+    $form_values['og_selective']['#type'] = 'hidden';
+    $form_values['og_selective']['#default_value'] = 0;
+    
+    //we don't want to see the og user registration fields
+    //users should be able to see this during registration
+    $form_values['og_register']['#type'] = 'hidden';
+    $form_values['og_register']['#default_value'] = 1;
+
+    //we don't want to see og list in directory fields
+    //groups should be listed in the directory  
+    $form_values['og_directory']['#type'] = 'hidden';
+    $form_values['og_directory']['#default_value'] = 1;
+
+    //we want to shrink up the mission statement section a bit tooo
+    $form_values['body_filter']['body']['#rows'] = 3;
+
+    //change some of the form descriptions to better suit our application
+    $form_values['og_description']['#description'] = 
+      t('A brief description for the group directory.');
+    $form_values['body_filter']['body']['#title'] = t('Group details');
+    $form_values['body_filter']['body']['#description'] = 
+      t('Additional information detailing the interests of the group and specific details on information they are interested in.');
+    $form_values['title']['#title'] = t('Group name');
+
+  }
+
+  $twitter_username_default = '';  
+  $args = func_get_args();
+  if (is_numeric($args[0]['#node']->nid)) {
+    if (! ($result = db_query("SELECT username from {group_twitter_account} WHERE nid=%d",   $args[0]['#node']->nid))) { 
+      watchdog('comms_group', 
+          t('Could not select twitter info from db for node->nid: @nid', array('@nid' => $args[0]['#node']->nid)));
+    }
+    else {
+      $select = db_fetch_array($result);
+      $twitter_username_default = $select['username'];
+    }//else
+  }
+
+  // Then, add the fields regular form fields that the user
+  // will see in this second step.
+  //TODO: this should be configureable based on the api's that are selected
+  //through the admin interface.
+  $form_values['comms_twitter_username'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Twitter username for %group group', array('%group' => $form_values['title']['#value'])),
+    '#required' => TRUE,
+    '#default_value' => $twitter_username_default,
+    '#description' => t('Each group needs to have a !twitterlink account associated with it.  If there isn\'t already one for the group !twittersignuplink now.', array( '!twitterlink' => l('twitter', "https://twitter.com/", array('target' => '_blank')), '!twittersignuplink' => l('add one', "https://twitter.com/signup", array('target' => '_blank')))),
+  );
+  
+  $form_values['comms_twitter_password'] = array(
+    '#type' => 'password',
+    '#title' => t('Twitter password'),
+    '#description' => t('This password is stored in clear text in the database.  The security of this password is protected by the administrators of this software.  You only need to add a password if your adding the group for the first time or if you associating this group with a new twitter account.')
+    );
+
+}//hook_form_alter
+
+//this is where we check to see if the username and password is valid
+function comms_group_form_validate($node, &$form = NULL) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_group_form_validate()');
+  }
+
+  //if the password is not sent in then we have to make sure it is in the db
+  if (strlen($node->comms_twitter_password) == 0) {
+    $account = comms_get_group_twitter_account($node->nid);
+    if (strlen($account['password']) == 0) {
+      form_set_error('comms_twitter_password', 
+        t('The twitter password field is required.'));
+      return;
+    }
+    else if (isset($account['username']) && 
+      $account['username'] != $node->comms_twitter_username) {
+      //if it is in the db then we assume it is good unless a new username
+        form_set_error('comms_twitter_password', 
+          t('You updated the username but did not provide a new password. The twitter password is required.'));
+      return;
+    }//else if
+
+    //else we are good because we are not updating anything associated
+    //with the twitter account
+    return;
+  }//if
+
+  //then we have to make sure that no other group is using this account
+  //otherwise there could be duplicate messages sent out to the same 
+  //group
+  if (!$result = db_query("SELECT * from {group_twitter_account} WHERE nid <> %d AND username='%s'", 
+    $node->nid, 
+    $node->comms_twitter_username)) {
+    watchdog('comms_group', 
+      t('Could not select from group_twitter_account.'));
+    form_set_error('comms_twitter_username', 
+      t('There was a internal error with the database.  Please notify the admin and try again later.'));
+    return;
+    } 
+
+  if (db_num_rows($result) > 0) {
+    watchdog('comms_group', 
+      t('Group @nid tried to set a twitter account with the same name as another group.',
+      array('@nid' => $node->nid)));
+    form_set_error('comms_twitter_username', 
+      t('There is another group already using that account, please use another twitter account.'));
+    return;
+  }
+
+  $twitter = _comms_twitterAPI_load(
+    $node->comms_twitter_username, $node->comms_twitter_password);
+
+  $response = '';
+  try {
+    $response = $twitter->verifyCredentials();
+  }catch (Exception $e) {
+    form_set_error('comms_twitter_username', 
+      t("twitter account did not validate.") .
+      $e->getMessage());
+    
+    //we don't have the gid yet and we won't have the nid yet either unless
+    //this is an update
+    comms_add_twitter_api_call($node->nid ? $node->nid : -1, -1, 'verifyCredentials', 1, 
+      0, $e->getMessage()); 
+  }
+
+  //but this function doesn't actually throw an exception f it can't 
+  //authenticate you only if something foo'd
+  if ($response->isError()) {
+    $error_message_web = scraping_twitter_error_page($response->getData());
+    $error_message_json = json_decode($response->getData(), 1);
+    $message = t('Twitter was not able to '.  'authenticate you.<br />Error Message: %errorweb<br />Error Message: %errorjson<br />',
+      array('%errorweb' => $error_message_web, '%errorjson' => $error_message_json['error']));
+
+    form_set_error('comms_twitter_username', $message);
+    
+    //we don't have the gid yet and we won't have the nid yet either unless
+    //this is an update
+    comms_add_twitter_api_call($node->nid ? $node->nid : -1, -1, 'verifyCredentials', 1, 
+      0, $message); 
+  }
+  else {
+    drupal_set_message(t('Your account was authenticated by Twitter.'));
+    
+    //we don't have the gid yet and we won't have the nid yet either unless
+    //this is an update
+    comms_add_twitter_api_call($node->nid ? $node->nid : -1, -1, 
+      'verifyCredentials', 1, 1, 
+      t("Twitter account for nid: %nid authenticated.", 
+        array('%nid' => $node->nid)));
+  }
+}
+
+
+//TODO:  should we be checking to make sure that there isn't more then one
+//use of a twitter account?
+function comms_group_form_insert($node) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message("comms_group_form_insert()");
+  }
+  if (! db_query("INSERT INTO {group_twitter_account} (nid, username, password) VALUES (%d, '%s', '%s')", $node->nid, $node->comms_twitter_username, 
+    $node->comms_twitter_password)) {
+      watchdog("comms_group", 
+        t("There was a problem inserting into group_twitter_account(nid=@nid, username=@username, password=@password).",
+        array('@nid' => $node->nid, 
+          '@username' => $node->comms_twitter_username,
+          '@password' => $node->comms_twitter_password)));
+      drupal_set_message(t("There was a problem updating the twitter settings for this group.  Have one of the admins check the logs."));
+  }//checking the db_query()
+}//comms_group_form_insert
+
+//we expect that comms_group_form_validate was called:
+//this 
+function comms_group_form_update($node) {
+  if (variable_get('comms_debuglevel', 0) > 0) { 
+    drupal_set_message("comms_group_form_update()");
+  }
+
+  //for an update to actually be called there has to be form data
+  //we knw that basic sanity checks are done in comms_group_form_validate
+  //but we need to double check here that we have data
+  if (strlen($node->comms_twitter_username) == 0 ||
+    strlen($node->comms_twitter_password) == 0) {
+    return;
+  }
+
+  //we need to check here is there is actually any new information
+  $account = comms_get_group_twitter_account($node->nid);
+
+  //if there are no rows we need to do an insert
+  if (!is_array($account) || count($account) == 0) {
+    comms_group_form_insert($node);
+    
+    //if any of the data has changed we need to check to make sure that
+    //the new account is valid and then do an update.
+  }
+  else if ($account['username'] != $node->comms_twitter_username ||
+    $account['password'] != $node->comms_twitter_password) {
+    if (! db_query("UPDATE {group_twitter_account} set username='%s', password='%s' WHERE nid=%d",
+      $node->comms_twitter_username, $node->comms_twitter_password,
+      $node->nid)) {
+      //Note that for mysql this will return a numeric value, pgsql a string
+      watchdog("comms_group", t("There was a problem updating the group_twitter_account with nid=@nid. Error: %db_error",
+        array('@nid' => $node->nid, '%db_error' => db_error())));
+      drupal_set_message(t("There is a database problem.  Your twitter account settings were not set for this group.  Have one of the admins check the logs."));
+      return;
+    }//if
+  }//else if
+}//comms_group_form_update
+
+//this gets called when a group node is being deleted
+//we need to delete the twitter account information
+function comms_group_delete($node) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    watchdog('comms_group', 'comms_group_delete()');
+  }
+
+  if (! ($result = db_query('DELETE from {group_twitter_account} WHERE nid=%d', $node->nid ) ) ) {
+    //Note that for mysql this will return a numeric value, pgsql a string
+    watchdog("comms_group", t("There was a problem deleting a row from group_twitter_account with nid: @nid. Error: %error",
+      array('@nid' => $node->nid, "%db_error" => db_error())));
+    drupal_set_message(t("There is a database problem.  Your twitter account settings were not deleted from the database.  Have one of the admins check the logs."));
+    return;
+  }
+}
+
+//this gets called when a group node is being displayed
+//we need to add the twitter account information
+function comms_group_view($node) {
+  if (! ($result = db_query('SELECT username,password from {group_twitter_account} WHERE nid=%d', $node->nid ) ) ) {
+    //Note that for mysql this will return a numeric value, pgsql a string
+    watchdog("comms_group", t("There was a problem selecting from group_twitter_account. Error: %db_error",
+      array('%db_error' => db_error())));
+    drupal_set_message(t("There is a database problem.  Your twitter account settings were not pulled from the database.  Have one of the admins check the logs."));
+    return;
+  }
+
+  if (! $select = db_fetch_array($result)) {
+    $node->content['body'] = array(
+      '#value' => theme('comms_group', 0, t("There is no twitter account associated with this group.  You should !add_link one now", array( 
+      '!add_link' => l(t("add"), "node/". $node->nid ."/edit")))));
+  }//if
+  else {
+    $node->content['body'] = array('#value' => theme('comms_group', $select));
+  }//else
+}
+
+/*
+  Never call this function before calling 
+  comms_group_dispatch_validate()
+
+  returns a error string on error and 1 on success
+
+  Dispatching consists of the following actions:
+  1) gather all the groups associated with that node
+  2) send a twitter post to each twitter account associated with each group
+*/
+function comms_group_dispatch($node) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    watchdog('comms_group', 'comms_group_dispatch()');
+  }
+
+  //we already verified that this exists in comms_group_dispatch_validate
+  $sms_message = comms_get_sms_message($node->nid);
+  $node_groups = module_invoke('og', 'get_node_groups', $node);
+
+  //this var is used to store a message about issues that may have 
+  //been recieved while attempting to dispatch to some of the 
+  //associated groups
+  $message = NULL;
+  
+  foreach (array_keys($node_groups) as $gid) {
+    
+    //we only want to dispatch to nodes that have not been dispatched to yet
+    //we know there exists some node because comms_submit_validate checks
+    if (!$result = db_query("SELECT dispatch_time from {comms_group_dispatch} WHERE nid=%d AND gid=%d", $node->nid, $gid)) {
+      watchdog("comms_group", t("Unable to select from the comms_group_dispatch table with nid=@nid and gid=@gid",
+        array('@nid' => $node->nid,  '@gid' => $gid)));
+      return t('we are unable to process this dispatch request because there is a problem the database.  Please contact an admin and try again later');
+    }//if
+
+    if (db_num_rows($result) == 0) {
+
+      //if there is not a record of dispatch 
+      //then there exisits a group that has not been dispatched to yet
+      //get the twitter account credentials
+      $account = comms_get_group_twitter_account($gid);
+      if (count($account) == 0) {
+        $message .= t("Unable to dispatch message to the %group group because there was no associated twitter account.", array('%group' => $node_groups[$gid]));
+
+        //then we jump to the next associated group
+        continue;
+      }//if
+
+      $twitter = _comms_twitterAPI_load( 
+        $account['username'], $account['password']);
+
+      $response = '';
+      try {
+        $response = $twitter->updateStatus($sms_message);
+      }catch (Exception $e) {
+        watchdog("comms_group", t("There was a problem trying to udate the twitter status for the %group group. Exception Message: @mess",
+          array('%group' => $node_groups[$gid], '@mess' => $e->getMessage())));
+        
+        $message .=  t("There was a problem dispatching via the twitter account for the %group group.  This error relates to internal functionality of the application.  Have one of the admins check the logs.",
+          array('%group' => $node_groups[$gid]));
+
+        comms_add_twitter_api_call($node->nid, $gid, 'updateStatus', 1, 
+          0, $e->getMessage); 
+
+        continue;
+      }//catch
+
+      //but this function doesn't actually throw an exception if it can't 
+      //update status only if something foo'd.  A response from twitter is
+      //a webpage, so we need to parse out the data we need.
+      if ($response->isError()) {
+        $error_message_web = scraping_twitter_error_page($response->getData());
+        $error_message_json = json_decode($response->getData(), 1);
+
+        $message .=  t("There was a problem trying to update the twitter status for the %group group.<br>Error Message: %errorwebError Message: %errorjson",
+          array('%group' => $node_groups[$gid],
+            '%errorweb' => $error_message_web,
+            '%errorjson' => $error_message_json['error']));
+        
+        watchdog("comms_group", $message);
+
+        comms_add_twitter_api_call($node->nid, $gid, 'updateStatus', 1, 
+          0, $message); 
+
+        continue;
+      }
+      else {
+        //we need to set a record for the time that each node was dispatched at
+        //being sure to log the out record so we can keep track of rate
+        $message .= t('SMS message dispatched to %group group',
+          array('%group' => $node_groups[$gid]));
+        
+        comms_add_twitter_api_call($node->nid, $gid, 'updateStatus', 1, 1); 
+
+        comms_update_group_dispatchtime($node->nid, $gid);
+      }//else
+
+    }//if
+  }//foreach
+
+  if (strlen($message) > 0) {
+    return $message; }
+
+  return 1;
+}
+
+//this fucntion will turn 1 if the node can be dispatched
+//and a string containing a error message if not
+function comms_group_dispatch_validate($node) {
+  //first we verify that this is a comms node
+  if ($node->type != 'comms') {
+    return t("You atempted to dispatch an invalid node type.");
+  }
+
+  //then we verify that this node has a sms_message
+  $sms_message = comms_get_sms_message($node->nid);
+  if ($sms_message == '') {
+    return t("There is no sms message associated with this node.");
+  }
+
+  //then we verify that there is at least one group associated with the node
+  $node_groups = module_invoke('og', 'get_node_groups', $node);
+  if (count($node_groups) == 0) {
+    return t("There are no groups associated with this node.");
+  }
+
+  //we need to check that if there are groups that they actually have a 
+  //twitter account.  A group without a twitter account should never 
+  //happen, unless the site is in a wierd state
+  foreach (array_keys($node_groups) as $gid) {
+    $account = comms_get_group_twitter_account($gid);
+    if (!is_array($account) || count($account) == 0) {
+      return t('Trying to dispatch to group %group but there is no twitter account associated with it.',
+        array('%group' => $node_groups[$gid]));
+    }
+  }
+
+  //we need to check that there exists nodes that this content has not 
+  //been dispatched to yet
+  $all_dispatch = 1;
+  foreach (array_keys($node_groups) as $gid) {
+    $query = "SELECT dispatch_time from {comms_group_dispatch} WHERE nid=%d AND gid=%d";
+    if (!$result = db_query($query, $node->nid, $gid, 0, 1)) {
+      watchdog("comms", t("Unable to select from the comms_group_dispatch table with nid=@nid and gid=@gid", 
+        array('@nid' => $node->nid, '@gid' => $gid)));
+      
+      return t('we are unable to process this dispatch request because there is a problem the database.  Please contact an admin and try again later');
+    }
+    else {
+      $select = db_fetch_array($result);
+
+      //if there is not a record of dispatch || if there is not a dispatch_time
+      //then there exisits at least one group that has not been dispatched to yet
+      if (db_num_rows($result) == 0 || is_null($select['dispatch_time'])) {
+        $all_dispatch = 0;
+        break;
+      }//if
+    }//else
+  }//foreach
+
+  if ($all_dispatch) {
+    return t('All of the groups associated with this node have already been dispatched.');
+  }//if
+
+  return 1;
+}
+
+/****************************************/
+/* CRON FUNCTIONS                       */
+/* all functions in this section handle */
+/* cront things                         */ 
+/****************************************/
+
+//we need to poll the direct messages and all messages sent by followers
+//for each group/twitter account that we are moderating.  For us to collect 
+//information from each of the followers we need to be friends with them 
+//which means we have to be following them.   The other option is to get a 
+//list of followers for each twitter account, then get a list of all direct 
+//messages for that account, then (not authenticated) do a search for each 
+//messages sent by each follower (creating drupal accounts as needed)
+//TODO: find out if we are going to get timeouts on this function
+function comms_cron() {
+  //this function is never called in the normal drupal context so this 
+  //code section is only useful when using the developer module
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_cron()');
+  }
+
+  //for all the database mods we are doing we will need to do them as 
+  //admin
+  global $user;
+  $user = user_load(array('uid' => 1));
+
+  //foreach group on the system 
+  //with a valid twitter account
+  //get all followers (add them)
+  //get all new direct messages (add them)
+
+  //do we need to know the groups name? - yes because we need to be able to 
+  //associate a user with the group they are a member of.
+  $groups = module_invoke('og', 'all_groups_options');
+  $all_followers = array();
+  foreach ($groups as $gid => $group) {
+
+    //TODO: calling of this needs to be controlled
+    $followers = comms_get_twitter_followers($gid);
+    if (is_array($followers)) {
+      foreach ($followers as $follower) {
+        comms_add_user_by_name_if_not_exist($follower);
+        $all_followers[$follower['name']] = $follower;
+      }//foreach
+    }//if
+
+  }//foreach
+
+  //We really only want to run this if we are assuming that users
+  //don't know how to use twitter correctly.
+  if (variable_get('comms_searchalltweets', 0)) {
+    //TODO: this should be split out into two parts, each of which can be
+    //turned on/off.  They are adding messages sent to our groups, and 
+    //adding messages sent by our groups followers
+    comms_add_twitter_tweets();
+  }//if
+  else if (variable_get('comms_addfromgetfollowers', 0)) {
+    comms_add_from_get_followers($all_followers);
+  }//else if
+}
+
+/****************************************/
+/* THEMING FUNCTIONS                    */
+/* all functions in this section change */
+/* the way drupal displays things,      */ 
+/* excluding content generated by this  */
+/* module                               */
+/****************************************/
+function theme_comms_priority($form) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('theme_comms_priority()');
+  }
+  
+  if (!isset($form) || $form == '') { 
+    return ''; }
+
+  $output = '<div class="comms_priority_form">';
+  $output .= drupal_render($form);
+  $output .= '</div>';
+  return $output;
+}
+
+function theme_comms_search_page($form) {
+  $output = '';
+  $output .= '<script type="text/javascript" '.
+    'src="/misc/collapse.js"></script>'.
+  $output .= '<div class="comms-search-page">';
+  $output .= '<fieldset class="collapsible collapsed">';
+  $output .= '<legend>Filtering</legend>';  
+  $output .= drupal_render_form('comms_search_page', $form) ;
+  $output .= '</fieldset>';
+  $output .= '</div>';
+  return $output;
+}
+
+function theme_comms_delete($link) {
+  $return = '';
+  $return .= '<div class="comms_delete">';
+  $return .= $link;
+  $return .= '</div>';
+  return $return;
+}
+
+
+function theme_comms_dedup($form) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('theme_comms_dedup()');
+  }
+  
+  if (!isset($form) || $form == '') { 
+    return ''; }
+
+  $output = '<div class="comms_dedup_form">';
+  $output .= drupal_render($form);
+  $output .= '</div>';
+  return $output;
+}
+
+function theme_comms_dispatch($form) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('theme_comms_dispatch()');
+  }
+
+  if (!isset($form) || $form == '') {
+  return ''; }
+
+  $output = '<div class="comms_dispatch_form">';
+  $output .= drupal_render($form);
+  $output .= '</div>';
+  return $output;
+}
+
+//this is for theming the display of the associated twitter account
+//not to be confused with theme_comms_groups()
+function theme_comms_group($unp, $error = NULL) {
+  $output = "<div id=\"comms_group\" class=\"comms\">";
+  if (!is_null($error)) {
+    $output .= "<div class=\"error\">$error</div>";
+  }
+  else {
+    $output .= "<div id=\"message\">".
+      t("Associated Twitter account") 
+      .": </div><div id=\"twitter_account\">".
+      l($unp['username'], "http://twitter.com/". $unp['username']) 
+      ."</div>";
+  }
+  $output .= "</div>";
+
+  return $output;
+}
+
+//
+function theme_comms_groups($groups) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('theme_comms_groups()');
+  }
+  
+  $return = '';
+  
+  //if there are no groups don't display anything
+  if (count($groups) == 0) {
+    $return .= '<div class="comms_groups_list">';
+    $return .= t('This node has not been associated with any groups yet.');
+    $return .= '</div>';
+    return $return;
+  }
+
+  $ct = 0;
+  $return .= '<div class="comms_groups_list">';
+  $return .= '<label for="comms_groups_list:">Groups:</label>';
+  
+  foreach ($groups as $nid => $name) {
+    $ct ? $return .= ', ' : $ct++;
+    $return .= l($name, "node/$nid");
+  }
+  $return .= '</div>';
+  
+  return $return;
+}
+
+function theme_comms_groups_form($form) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('theme_comms_groups_form()');
+  }
+
+  $return = '';
+  $return .= '<div class="comms_groups_form">';
+  $return .= drupal_render($form);
+  $return .= '</div>';
+  return $return;
+}
+
+function theme_comms_sms_message($message) {
+  if (!isset($message) || $message == '') {
+    return '<div class="comms_sms_message error">There is no sms message.</div>';
+  }
+  else {
+    return '<div class="comms_sms_message"><label>'.
+      t("SMS Message")
+      .': </label>'. $message .'</div>';
+  }
+}
+
+function theme_comms_dispatch_message($message) {
+  if (!isset($message) || $message == '') {
+    return '';}
+  else {
+    return '<div class="comms_dispatch comms_dispatch_message">'. $message .'</div>';
+  }
+  
+}
+
+function comms_node($node, $teaser, $page = FALSE) {
+  if (!$node->status) {
+     $output  = '<div class="node-unpublished">';
+   }
+
+  if (module_exists('taxonomy')) {
+  $terms = taxonomy_link('taxonomy terms', $node);
+  }
+
+  if ($page == 0) {
+    $output .= t('
+      !title by !name', 
+      array('!title' => '<h2 class="title">'. check_plain($node->title) .'</h2>', 
+      '!name' => theme('username', $node)));
+  }
+  else {
+    $output .= t('by !name', array('!name' => theme('username', $node)));
+  }
+
+  if (count($terms)) {
+    $output .= ' <small>('. theme('links', $terms) .')</small><br />';
+  }
+
+  if ($teaser && $node->teaser) {
+    $output .= $node->teaser;
+  }
+  else {
+    $output .= $node->body;
+  }
+  if ($node->links) {
+    $output .= '<div class="links">'. theme('links', $node->links) .'</div>';
+  }
+
+  if (!$node->status) {
+    $output .= '</div>';
+  }
+
+  return $output;
+
+}
+
+//function that will generate the themed section that holds
+//the Rating, Groups, Dispatch section of a comms node
+function create_rgd_section($node) {
+  $return ='';
+  $return .= '<div class="rgd_section">';
+
+  $asc_groups = module_invoke('og', 'get_node_groups', $node);
+  $dispatched_to = 0;
+
+    //if the node has already been dispatched we don't display any of this
+  if (!$dispatched_to = comms_has_been_dispatched($node->nid)) {
+    $return .= drupal_get_form('comms_vote_node_'. $node->nid, 'node', $node->nid);
+
+    //this is to list the priority taxonomy terms
+    $return .= drupal_get_form('comms_priority_node_'. $node->nid, 'node', $node->nid);
+
+    //this is to list duplicate nodes
+    //TODO: everything was cool untill we did this, check it out
+    $return .= drupal_get_form('comms_dedup_node_'. $node->nid, 'node', $node->nid);
+    
+    //this is to create a form for changing the associated groups  
+    $return .= drupal_get_form('comms_groups_node_'. $node->nid, 'node', $node->nid);
+
+    $return .= '<div class="gd_section">';
+
+    $return .= theme('comms_groups', $asc_groups);
+
+    //we should not include the the dispatch form until
+    //we have a sms message and an associated group
+    //include the dispatch/verify form
+    if (count($asc_groups) > 0) {
+      $return .= drupal_get_form('comms_dispatch_node_'. $node->nid, 'node', $node->nid);
+    }//if
+    
+    $return .= '</div>';
+  }//if
+  else {
+    $return .= theme('comms_groups', $asc_groups);
+    $message = "<label>". t("Dispatched At") .": </label>";
+    $first = 1;
+    
+    $row = db_fetch_array($dispatched_to);
+    $message .= $row['dispatch_time'];
+    $return .= theme('comms_dispatch_message', $message);
+  }//else
+
+  $return .= '</div>';
+
+  return $return;
+
+}//create_rgs_section
+
+/*****************************/
+/* HELPER FUNCTIONS          */
+/*****************************/
+/**
+ * Checks the that the directory in $form_element exists and contains the file
+ * named 'Twitter.php' and 'TwitterSearch.php'. If validation fails, the form 
+ * element is flagged with an error from within the file_check_directory 
+ * function. See: system_check_directory()
+ *
+ * @param $form_element
+ *   The form element containing the name of the directory to check.
+ */
+function _comms_twitterAPI_settings_check_path($form_element) {
+  $path = $form_element['#value'];
+  if (!is_dir($path) || 
+    !comms_twitterAPI_isfound($path, FALSE)) {
+    form_set_error($form_element['#parents'][0], t('The Twitter API files <em>Twitter.php</em> and <em>TwitterSearch.php</em> could not be found in the %path directory.', array('%path' => $path)));
+  }
+  return $form_element;
+}
+
+/**
+ * Can we find and (hopefully) load the Twitter API libraries?
+ *
+ * @param $twitterAPI_path
+ *   optional path to the twitterAPI directory with Twitter.php and 
+ *   TwitterSearch.php in it.
+ * @param $report_error
+ *   boolean indicating if an error should be set if TwitterAPI can't be found.
+ * @return
+ *   Boolean indicating if the library was found
+ */
+function comms_twitterAPI_isfound($twitter_API_path = NULL, $report_error = FALSE) {
+  if (is_null($twitter_API_path)) {
+    $twitter_API_path = variable_get('comms_twitter_API_path', 
+      drupal_get_path('module', 'comms') .'/Arc90_Service_Twitter/lib/Arc90/Service');
+  }
+  if (file_exists($twitter_API_path .'/Twitter.php') && 
+    file_exists($twitter_API_path .'/TwitterSearch.php')) {
+    return TRUE;
+  }
+  if ($report_error) {
+    drupal_set_message(
+      t("The comms module cannot find the Twitter API library used to communicate with twitter.com. The site administrator will need to verify that it is installed and then update the !twitter_API_settings_link.", array(
+        '!twitter_API_settings_link' => l('settings', 'admin/settings/comms/twitterAPI'))),
+      'error'
+    );
+  }
+  return FALSE;
+}
+
+/**
+ * Build a Twitter object.
+ *
+ * @return
+ *   a Twitter object.
+ */
+function _comms_twitterAPI_load($username = NULL, $password = NULL) {
+  $path = variable_get('comms_twitterAPI_path', 
+    drupal_get_path('module', 'comms') .'/Arc90_Service_Twitter/lib/Arc90/Service');
+  if (!comms_twitterAPI_isfound($path, TRUE)) {
+    return NULL;
+  }
+
+  //we need to make sure that the new include path is set.  We do this not only
+  //for Twitter.php, but the other libs that Twitter.php calls
+  if (!preg_match('{/Arc90/Service}', ini_get('include_path'))) {
+    preg_match('{(.*)/Arc90/Service}', $path, $new_include_path);
+    ini_set('include_path', ini_get('include_path') .':'. 
+      $new_include_path[1] .':'. 
+      $new_include_path[0]);
+  }
+
+  require_once('Twitter.php');
+  $twitter = new Arc90_Service_Twitter($username, $password);
+  return $twitter;
+}
+
+/**
+ * Build a Twitter Search object.
+ *
+ * @return
+ *   a Twitter object.
+ */
+function _comms_twitterSearchAPI_load() {
+  $path = variable_get('comms_twitterAPI_path', 
+    drupal_get_path('module', 'comms') .'/Arc90_Service_Twitter/lib/Arc90/Service');
+  if (!comms_twitterAPI_isfound($path, TRUE)) {
+    return NULL;
+  }
+
+  //we need to make sure that the new include path is set.  We do this not only
+  //for Twitter.php, but the other libs that Twitter.php calls
+  if (!preg_match('{/Arc90/Service}', ini_get('include_path'))) {
+    preg_match('{(.*)/Arc90/Service}', $path, $new_include_path);
+    ini_set('include_path', ini_get('include_path') .':'. 
+      $new_include_path[1] .':'. 
+      $new_include_path[0]);
+  }
+
+  require_once('TwitterSearch.php');
+  $twitter = new Arc90_Service_Twitter_Search();
+  return $twitter;
+}
+
+//Helper function for processing and adding status messages returned
+//from comms_get_twitter_followers()
+function comms_add_from_get_followers($followers) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_add_from_get_followers()');
+  }
+
+  //we don't want to pull in data older then what we already have. With the
+  //exception that if we have not pulled anything in with this method before
+  //message id's from followers are not ordered
+  $max_msg_id = variable_get('comms_twitterfollowermsgmaxid', 0);
+  $new_max_msg_id = 0;
+  if (is_array($followers)) {
+    foreach ($followers as $name => $follower) {
+
+      //some of the followers will not have a status associated with them
+      //we will just skip them
+      if (!isset($follower['message']) || 
+        !isset($follower['message_id']) || 
+        !isset($follower['name'])) {
+        continue;
+      }//if
+
+      if ($follower['message_id'] > $max_msg_id) {
+        $errors = comms_add_comms_from_twitter($follower['message'], 
+          $follower['name']);
+        
+        if (count($errors)) {
+          watchdog('comms_group', 
+            t('comms_cron() did not succeed: %errors',
+              array('%errors' => print_r(check_plain($errors), 1))));
+        }
+  else if ($follower['message_id'] > $new_max_msg_id) {
+            $new_max_msg_id = $follower['message_id'];
+        }
+      }
+    }//foreach
+
+    if ($new_max_msg_id > $max_msg_id) {
+      variable_set('comms_twitterfollowermsgmaxid', $new_max_msg_id);
+    }//if
+  }//if  
+}
+
+function comms_add_comms_from_twitter($message, $user, $reset = NULL) {
+  if (!isset($message) || !isset($user)) {
+    return;
+  }
+
+  static $tusers;  
+  if (!isset($tusers) || $reset) {
+    //get the list of our groups
+    $tusers = array();
+    $groups = module_invoke('og', 'all_groups_options');
+    while ($name = current($groups)) {
+      $account = comms_get_group_twitter_account(key($groups));
+      $tusers = array_merge($tusers, array($account['username'] => key($groups)));
+      next($groups);
+    }
+  }
+
+  $values = array();
+  $values['body'] = t('message recieved from twitter: ');
+  
+  //there can be encoded html characters in the message, we handle 
+  //them here.
+  $message = htmlspecialchars_decode($message);
+
+  //see simplefeed_item.module for an example of this
+  //we want to make sure here that this is nt a tweet meant for a 
+  //group that we are not trancking
+  //then if this is a message directed at another user that is not
+  //one of the groups we care about we ignore it
+  //http://help.twitter.com/index.php?pg=kb.page&id=75  
+  if (preg_match('/^@(\w+)\s(.*)$/', $message, $matches)) {
+    if (array_key_exists($matches[1], $tusers)) {
+      $values['sms_message'] = $matches[2];
+      $values['body'] .= $matches[2];
+      $values['to'] = $matches[1];
+    }
+  else {
+      return;
+    }
+    
+
+  }//if
+  else {
+    $values['body'] .= $message;
+    $values['sms_message'] = $message;
+  }
+  
+  $node->type = 'comms';
+  
+  //for the title we want the first 8 words
+  $values['title'] = split(' ', $values['sms_message'], 8);
+  if (count($values['title']) == 8) {
+    array_pop($values['title']);
+  }
+  $values['title'] = implode(' ', $values['title']);
+
+  //we want to add the group membership if there is one  
+  if ($values['to']) {
+    $values['og_groups'] = array($tusers[$values['to']] => $tusers[$values['to']]);
+  }
+
+  $values['name'] = $user;
+
+  drupal_execute('comms_node_form', $values, $node);
+  $errors = form_get_errors();
+
+  return $errors;
+}
+
+function comms_has_been_dispatched($nid) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_has_been_dispatched()');
+  }
+  
+  if (!$result = db_query("SELECT DISTINCT(dispatch_time) from {comms_group_dispatch} WHERE nid=%d", $nid )) {
+      watchdog("comms_group", t("Unable to select from the comms_group_dispatch table with nid=@nid", array('@nid' => $nid)));
+      drupal_set_error(t('comms_dispatch_submit', 'we are unable to process this dispatch request because there is a problem the database.  Please contact an admin and try again later'));
+      return -1;
+  }
+  
+  return (db_num_rows($result) == 0) ? 0 : $result;
+}
+
+function comms_add_user_by_name_if_not_exist($follower) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_add_user_if_not_exist()');
+  }
+  
+  if (user_load(array('name' => $follower['name']))) {
+    return;
+  }
+
+  //add the user if it does not exist
+  $account = (object) array();
+  $options['name'] = $follower['name'];
+  $options['mail'] = $follower['name'] .'@twitter.com';
+
+  if ($follower['twitterUID']) {
+    $options['twitterUID'] = $follower['twitterUID'];
+  }
+
+  return user_save($account, $options);
+}
+
+//will try to get all new from messages (random tweets) and add them to the
+//system
+function comms_add_twitter_tweets() {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_add_twitter_tweets()');
+  }
+
+  //for each twitter user
+  //get all messages sent through the search api
+  //note we should not add the message id here.  If we do we need to rethink
+  //the logic above
+
+  //get the list of our groups
+  $tusers = array();
+  $groups = module_invoke('og', 'all_groups_options');
+  while ($name = current($groups)) {
+    $account = comms_get_group_twitter_account(key($groups));
+    $tusers = array_merge($tusers, array($account['username'] => key($groups)));
+    next($groups);
+  }
+
+  $messages = comms_get_twitter_tweets();
+
+  if (is_array($messages)) {
+    foreach ($messages as $message) {
+      //$errors = comms_add_from_twitter($message['message'], 
+      $errors = comms_add_comms_from_twitter($message['message'], 
+        $message['user']);
+
+      if (count($errors)) {
+        watchdog('comms_group', 'comms_cron() did not succeed: '. 
+          $errors);
+      }
+  else if (variable_get('comms_twitterfrommsgmaxid', 0) < 
+        $message['id']) {
+        variable_set('comms_twitterfrommsgmaxid', $message['id']);
+      }
+    }//foreach
+  }//if
+}//comms_add_twitter_tweets
+
+//gets all users that were added from twitter.  Returns an array of twitter
+//user names.
+function comms_get_twitter_users() {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_get_twitter_users()');
+  }
+
+  $return = NULL;
+
+  if (! ($result = db_query('SELECT uid from {users}'))) {
+    watchdog('comms', 
+      t('Could not select the twitter users from the database.'));  
+    return $return;
+  } 
+
+  while ($dbuser = db_fetch_array($result)) {
+    $user = user_load(array('uid' => $dbuser['uid']));
+    if ($user === FALSE) {
+      continue; 
+    }
+
+    if ($user->twitterUID) {
+      $return[] = $user->name;
+    }
+  }//while
+  return $return;
+}
+
+//gets all the followers for a a group that has a twitter account associated
+//with it.  returns an an array of associative arrays in the form:
+/*
+  Array
+  (
+    Array
+    (
+      [name] => <twitter username>,
+      [twitterUID] => <twitter user uid>
+    )[,...]
+  )
+
+ */
+function comms_get_twitter_followers($gid) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_get_twitter_followers()');
+  }
+
+  $return = NULL;
+
+  //if there is no twitter account associated borf!
+  $ta = comms_get_group_twitter_account($gid);
+  if (is_null($ta)) {
+    return $ta;
+  }
+  
+  //there is a situation here were we will only get 100 users from a request in order
+  //that they created their accounts.  If we have more then 100 users we would like to
+  //get all of them
+  $twitter = _comms_twitterAPI_load($ta['username'], $ta['password']);  
+  $page = 1;
+  while (1) {
+    try {
+      $messages = $twitter->getFollowers('json', $page);
+    }catch (Exception $e) {
+      watchdog('comms_group', t('unable to get followers for gid:@gid, %mess',
+        array('@gid' => $gid, '%mess' => $e->getMessage())));
+
+      comms_add_twitter_api_call(-1, $gid, 'getFollowers', 1, 0, 
+        $e->getMessage()); 
+
+      return $return;
+    }
+    
+    if ($messages->isError()) {
+      $error_message_web = scraping_twitter_error_page($messages->getData());
+      $error_message_json = json_decode($messages->getData(), 1);
+
+      $message = t("There was a problem trying to get the followers associated with gid:@gid. Error: @errorweb. Error: @errorjson", array(
+        '@gid' => $gid,
+        '@errorweb' => $error_message_web,
+        '@errorjson' => $error_message_json['error']));
+
+      watchdog("comms_group", $message);
+      
+      comms_add_twitter_api_call(-1, $gid, 'getFollowers', 1, 0, $message);
+
+      return $return;
+    }
+  else {
+      $userct = 0;
+      foreach (json_decode($messages->getData(), 1) as $message) {
+        $userct++;
+        $name = $message['screen_name'];
+        $uid = $message['id'];
+        $msg = isset($message['status']['text']) ? $message['status']['text'] : NULL;
+        $msgid = isset($message['status']['id']) ? $message['status']['id'] : NULL;
+        $return[] = array(
+          'name' => $name, 
+          'twitterUID' => $uid,
+          'message' => $msg,
+          'message_id' => $msgid
+        );
+      }//foreach
+
+      if ($userct == 100) {
+        $page++;
+      }
+      else {
+        $message = t('Got %count followers for gid: @gid',
+          array('%count' => count($return), '@gid' => $gid));
+        watchdog("comms_group", $message);
+        comms_add_twitter_api_call(-1, $gid, 'getFollowers', 1, 1, $message); 
+        return $return;
+      }//else
+    }//else
+  }//while
+}//comms_get_twitter_followers
+
+//TODO: determine what the limit is on the number of from: searches we can do
+//at one time and break the search up into multiple requests
+//TODO: maybe we should limit this to a specific time as well ... for example
+//maybe we only search for tweets newer then today
+
+//gets all tweets for all twitter users that have been added to the 
+//installation.  returns an array of associative arrays in the form:
+/*
+  Array
+  (
+    Array
+    (
+      [user] => <twitter username>,
+      [message] => <tweet>,
+      [id] => <twitter message id>,
+      [twitterUID] => <twitter sender uid>
+    )[, ...]
+  )
+*/
+function comms_get_twitter_tweets() {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_get_twitter_tweets()');
+  }
+
+  $return = NULL;
+
+  $tusers = comms_get_twitter_users();
+
+
+  //if there are no twitter users don't even bother
+  if (count($tusers) <= 0) {
+    return $return;
+  }
+
+  $maxmsgid = variable_get('comms_twitterfrommsgmaxid', 0);
+
+  $twitter = _comms_twitterSearchAPI_load();  
+  //it seems like we can only search for at most 8 users at a time
+  //we will limit it to 6 just to be safe
+  $offset = 0;
+  while ($tusers6 = array_slice($tusers, $offset, 6)) {
+
+    $page=1;
+    $break=0;
+    //There is a situation where we may have more then 100 tweets for these 6 users
+    //since the last check
+    while (!$break && $page<5) {
+      try {
+        $messages = $twitter->getTweetsForUsers($tusers6, 'json', $maxmsgid, $page);
+      }catch (Exception $e) {
+        $message =  t("There was a problem trying to get the tweets associated with users: @users. Error Message: @mess", array( 
+          '@users' => implode(', ', $tusers6), '@mess' => $e->getMessage()));
+
+        watchdog('comms_group', $message);
+
+        comms_add_twitter_api_call(-1, -1, 'twitterSearchAPI::from()', 0, 0,
+          $message);
+
+        return $return;
+      }
+      
+      if ($messages->isError()) {
+
+        //needed to get the error message when twitter can't even give a proper error
+        $error_message_web = scraping_twitter_error_page($messages->getData());
+        $error_message_json = json_decode($messages->getData(), 1);
+
+        $message =  t("There was a problem trying to get the tweets associated with users: @users.Error Message: @errorweb. Error Message: @errorjson.", array(
+          '@users' => implode(', ', $tusers6),
+          '@errorweb' => $error_message_web,
+          '@errorjson' => $error_message_json['error']));
+
+        watchdog("comms_group", $message);
+        
+        comms_add_twitter_api_call(-1, -1, 'twitterSearchAPI::from()', 0, 0, 
+          $message);
+
+        return $return;
+      }
+  else {
+        $message_list = json_decode($messages->getData(), 1);
+        $message_list = $message_list['results'];
+        
+        if (is_array($message_list)) {
+          $msgct = 0;
+          foreach ($message_list as $message) {
+            $msgct++;
+            $text = $message['text'];
+            $sender = $message['from_user'];
+            $uid = $message['from_user_id'];
+            $id = $message['id'];
+            $return[] = array(
+              'user' => $sender, 
+              'message' => $text, 
+              'id' => $id,
+              'twitterUID' => $id);
+          }//foreach
+
+          ($msgct >= 100) ? $page++ : $break=1;
+           
+        }
+  else {
+          $break=1;
+        }
+
+        $message = t('Got %count tweets for users: @users', array(
+          '%count' => count($return), '@users' => implode(', ', $tusers6)));
+        comms_add_twitter_api_call(-1, -1, 'twitterSearchAPI::from()', 0, 1, 
+          $message); 
+
+      }//else
+    }//while
+
+    $offset+=6;
+  }//while
+
+  $message = t('Got %count tweets for users: @users', array(
+    '%count' => count($return), '@users' => implode(', ', $tusers)));
+  
+  watchdog("comms_group", $message);
+
+  return $return;
+  
+}
+//gets all direct messages for a group that has a twitter account associated
+//with it.  returns an array of associative arrays in the form:
+/*
+  Array
+  (
+    Array
+    (
+      [user] => <twitter username>,
+      [message] => <twitter direct message>,
+      [id] => <twitter message id>,
+      [twitterUID] => <twitter sender uid>
+    )[, ...]
+  )
+*/
+function comms_get_twitter_group_direct_messages($gid) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_get_twitter_group_direct_messages()');
+  }
+
+  $return = NULL;
+
+  //if there is no twitter account associated borf!
+  $ta = comms_get_group_twitter_account($gid);
+  if (is_null($ta)) {
+    return $ta;
+  }
+  
+  $twitter = _comms_twitterAPI_load($ta['username'], $ta['password']);  
+
+  //get the most recently recorded twitter direct message id 
+  $msgid = variable_get('comms_twitterdirectmsgmaxid', 0);
+
+  //this function call returns that last 20 direct messages that were recieved
+  //there is a possibility that we have recieved more then 20 direct messages
+  //since the last time that we checked, so we should continue to pull messages
+  //until we recieve one that is < comms_twitterdirectmsgmaxid  
+  $page = 1;
+  while (1) {
+    try {
+      $messages = $twitter->getMessages('json', '', $msgid, $page);
+    }catch (Exception $e) {
+      watchdog('comms_group', t('unable to get direct messages for gid: @gid, message: @mess', array( 
+        array('@gid' => $gid, '@mess' => $e->getMessage()))));
+
+      comms_add_twitter_api_call(-1, $gid, 'getMessages', 1, 0, 
+        $e->getMessage()); 
+
+      return $return;
+    }
+    
+    if ($messages->isError()) {
+      $error_message_web = scraping_twitter_error_page($messages->getData());
+      $error_message_json = json_decode($messages->getData(), 1);
+
+      $message = t("There was a problem trying to get the followers associated with gid:@gid. Error: @errorweb. Error: @errorjson", array(
+        '@gid' => $gid,
+        '@errorweb' => $error_message_web,
+        '@errorjson' => $error_message_json['error']));
+
+      watchdog("comms_group", $message);
+      
+      comms_add_twitter_api_call(-1, $gid, 'getMessages', 1, 0, $message);
+
+      return $return;
+    }
+  else {
+      $messagect = 0;
+      foreach (json_decode($messages->getData(), 1) as $message) {
+        $messagect++;
+        $text = $message['text'];
+          $sender = $message['sender']['screen_name'];
+        $uid = $message['sender']['id'];
+        $id = $message['id'];
+        $return[] = array(
+          'user' => $sender, 
+          'message' => $text, 
+          'id' => $id,
+          'twitterUID' => $id);
+      }//foreach
+
+      if ($messagect == 20) {
+        $page++;
+      }
+      else {
+        $message = t('Got %count tweets for users: @users', array(
+          '%count' => count($return), '@users' => implode(', ', $tusers)));
+        watchdog("comms_group", $message);
+        comms_add_twitter_api_call(-1, $gid, 'getMessages', 1, 1, $message); 
+        return $return;
+      }
+    }//else
+  }//while
+  
+}
+
+function comms_get_sms_message($nid = NULL) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_get_sms_message()');
+  }
+
+  if (is_null($nid)) {
+    return ''; }
+
+  if (! ($result = db_query('SELECT sms_message from {comms_additions} WHERE nid=%d', $nid))) {
+    watchdog('comms', t('Could not select the sms message for nid: @nid', 
+      array('@nid' => $nid)));  
+    return '';
+  }
+  else {
+    $select = db_fetch_array($result);
+    if (!isset ($select['sms_message']) || $select['sms_message'] == '') {
+      return '';
+    }
+  else {
+      return $select['sms_message'];
+    }
+  }
+}
+
+//returns an associative array containing the account information for the
+//associated group wth nid = $gid
+function comms_get_group_twitter_account($gid = NULL) {
+  if (variable_get('comms_debuglevel', 0) > 0) {
+    drupal_set_message('comms_get_group_twitter_account()');
+  }
+
+  if (is_null($gid)) {
+    watchdog('comms_group', t('comms_get_group_twitter_account called without a group id.'));
+    return NULL;
+  }
+
+  $query = "SELECT username, password from {group_twitter_account} WHERE nid=%d";
+  if (! ($result = db_query_range($query, $gid, 0, 1))) {
+      watchdog('comms_group', t('Could not select the twitter password from db for nid: @nid', array('@nid' => $gid)));
+      return NULL;
+  }
+  else {
+    $select = db_fetch_array($result);
+    return $select;
+  }//else
+}
+
+function comms_add_twitter_api_call($nid, $gid, $function, $authenticated, 
+  $success = 1, $message = '') {
+  if (!db_query("INSERT INTO {twitter_api_calls} (nid, gid, function, authenticated, success, message) VALUES(%d, %d, '%s', %d, %d, '%s')",
+    $nid, $gid, $function, $authenticated, $success, $message)) {
+
+    watchdog('comms_group', t('Could not update the record of twitter api calls.  Arguments: (@nid, @gid, @fun, @auth, @suc, @mess)', array(
+        '@nid' => $nid, '@gid' => $gid, '@fun' => $function, 
+        '@auth' => $authenticated, '@suc' => $success, '@mess' => $message))); 
+    return NULL;
+  }//if
+}
+
+function comms_update_group_dispatchtime($nid, $gid) {
+  if (!db_query('INSERT INTO {comms_group_dispatch} (nid, gid) VALUES(%d, %d)', $nid, $gid)) {
+      watchdog('comms_group', 
+        t('Could not update the record of comms group dispatch.  Arguments: (@nid, @gid)', array('@nid' => $nid, '@gid' => $gid)));
+    return NULL;
+  }
+}
+
+function uid_to_username_points_link($uid) {
+  if (!is_numeric($uid)) {
+    return '';
+  }
+
+  $username = uid_to_username($uid);
+  $points = userpoints_get_current_points($uid);
+  return l("$username ($points)", "user/$uid");
+}
+
+function uid_to_username($uid) {
+  if (!is_numeric($uid)) {
+    return '';
+  }
+
+  $sql = "SELECT name FROM {users} WHERE uid = %d";
+  $result = db_query($sql, $uid);
+  $username = db_fetch_object($result);
+  return $username->name;
+}
+
+//returns an error string from a twitter error page
+function scraping_twitter_error_page($page) {
+
+  //this is a php web scrapping library pulled from here:
+  //Website: http://sourceforge.net/projects/simplehtmldom
+  include_once('simple_html_dom.php');
+
+  $dom = str_get_dom($page);
+
+  $error = '';
+  foreach ($dom->find('div.wrapper') as $wrap) {
+    $error .= trim(preg_replace('/ +|\n|\r/', ' ', $wrap->plaintext));
+  }//foreach
+  
+  return $error;
+}

@@ -1,0 +1,4 @@
+; $Id$
+name = Comms
+description = "This module provides functionality required by a communications team."
+dependencies = views taxonomy og votingapi userpoints

@@ -1,0 +1,102 @@
+<?php
+// $Id$
+
+/*
+ * @file
+ * Installation functions for the comms module
+ *
+ * there is some docs on the drupal DB schema here: http://projects.contentment.org/blog/84
+ * when doing database operations in this file try to use the DB API as much as
+ * possible (http://api.drupal.org/api/group/database/5)
+ *
+ * TODO: migrate all auto increment fields to use the drupal's sequences
+ * TODO: put an index on votingapi_cache.function of length 8
+ */
+
+function comms_install() {
+
+  switch ($GLOBALS['db_type']) {
+    case 'mysql':
+      case 'mysqli':
+      
+      // the {tablename} syntax is so multisite installs can add a
+      // prefix to the table name as set in the settings.php file
+      
+      //not to be confused with content_type_comms which will be added if
+      //cck content is added, which we are not using!
+      db_query("CREATE TABLE {comms_additions} (
+         `nid` int(10) unsigned NOT NULL default 0,
+        `sms_message` varchar(140) NOT NULL default '',
+           PRIMARY KEY (`nid`)
+           );");
+
+      db_query("CREATE TABLE {group_twitter_account} (
+         `nid` int(10) unsigned NOT NULL default 0,
+        `username` varchar(32) NOT NULL default '',
+        `password` varchar(32) NOT NULL default '',
+           PRIMARY KEY (`nid`)
+      );");
+
+      db_query("CREATE TABLE {twitter_api_calls} (
+        `tacid` INT NOT NULL AUTO_INCREMENT ,
+        `nid` INT NOT NULL ,
+        `gid` INT NOT NULL ,
+        `function` VARCHAR( 32 ) NOT NULL ,
+        `authenticated` BOOL NOT NULL ,
+        `call_time` timestamp NULL default CURRENT_TIMESTAMP,
+        `success` tinyint(1) default '1',
+        `message` varchar(256) default NULL,
+        PRIMARY KEY ( `tacid` )
+        );");
+
+      db_query("CREATE TABLE {comms_group_dispatch} (
+        `nid` int(11) NOT NULL,
+        `gid` int(11) NOT NULL,
+        `dispatch_time` timestamp NULL default CURRENT_TIMESTAMP,
+        PRIMARY KEY  (`nid`,`gid`)
+      );");
+      
+      //we will install the default comms variables here
+      variable_set('comms_actionname', "comms");
+      variable_set('comms_dispatchlevel', 5);
+      variable_set('comms_debuglevel', 0);
+      variable_set('comms_twitterdirectmsgmaxid', 0);
+      variable_set('comms_twitterfrommsgmaxid', 0);
+
+    break;
+
+      //we have not implemented this for postgres :(
+      case 'pgsql':
+      // Pgsql requires keys and indexes to be defined separately.
+      // It's important to name the index as {tablename}_fieldname_idx
+      // (the trailing _idx!) so update scripts can be written easily
+      break;
+  }
+}
+
+function comms_uninstall() {
+  watchdog("comms", "removing the comms module");
+
+  if (! db_query("DROP TABLE {comms_additions};")) {
+    watchdog("comms", "problem removing table comms_additions", WATCHDOG_ERROR);
+  }
+
+  if (! db_query("DROP TABLE {group_twitter_account};")) {
+    watchdog("comms", "problem removing table group_twitter_account", WATCHDOG_ERROR);
+  }
+
+  if (! db_query("DROP TABLE {twitter_api_calls};")) {
+    watchdog("comms", "problem removing table twitter_api_calls", WATCHDOG_ERROR);
+  }
+
+  if (! db_query("DROP TABLE {comms_group_dispatch};")) {
+    watchdog("comms", "problem removing table twitter_api_calls", WATCHDOG_ERROR);
+  }
+
+  watchdog("comms", "deleting all of the variables used by the comms module");
+  variable_del('comms_actionname');
+  variable_del('comms_dispatchlevel');
+  variable_del('comms_debuglevel');
+  variable_del('comms_twitterdirectmsgmaxid');
+  variable_del('comms_twitterfrommsgmaxid');
+}

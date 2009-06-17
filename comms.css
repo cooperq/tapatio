@@ -1,0 +1,232 @@
+div.comms .node {
+	padding: 5px;
+	margin-bottom: 3px;
+	margin-top: 3px;
+}
+
+.comms h2 {
+	display: block;
+}
+
+.comms .submitted {
+	display: block;
+	position: relative;
+	top: -20px;
+	float: right;
+	
+}
+
+.comms .comms-form-item {
+	border: 1px solid black;
+	height: 42px;
+	margin: 0px;
+	padding: 0px;
+}
+
+
+.comms-form-item .comms-vote-summary {
+	/*border: 2px dashed blue;*/
+	margin: 0px;
+	padding: 0px;
+	font-size: small;
+	margin-top: 9px;
+	padding-left: 4px;
+	
+}
+
+.comms .comms-form-item .form-item {
+	/*border: 1px green dotted;*/
+	background-color: beige;
+	text-align: right;
+	margin: 0px;
+	padding: 0px;
+	margin-right: 5px;
+	font-size: medium;
+	float: left;
+}
+
+.comms .comms-form-item .form-item > div > div:first-child{
+	border-bottom: 1px black solid;
+}
+
+.comms .comms-form-item .form-item > div > div{
+	border-right: 1px black solid;
+	padding-right: 4px;
+}
+
+.comms .comms_group_submit {
+	margin: 0px;
+	padding: 0px;
+}
+
+/* this is the container for the Rating, Groups, Dispatch section */
+.rgd_section {
+	width: 100%;
+	/* border-top: thin solid black; */
+	position: relative;
+	margin-left: 0px;
+	margin-right: 0px;
+	top: -10px;
+	left: 0px;
+	height: 100px;
+  border:1px solid #444;
+}
+
+/* this is the left most section of the RGD container */
+#comms_vote {
+	position: absolute;
+	top: 5px;
+	left: 5px;
+	border: 0px;
+	margin: 0px;
+	width: 130px;
+	height: 80px;
+	/* background-color: yellow; */
+}
+
+.comms-vote {
+	border: 0px;
+	padding: 0px;
+	margin: 0px;
+	background-color: #9CCFFF;
+}
+
+
+#comms_vote label{
+	font-weight: bold;
+	float: left;
+}
+
+#comms_vote .value{
+	float: left;
+	color: green;
+	padding-left: 10px;
+	font-size: large;
+}
+
+.comms_priority_form {
+	position: absolute;
+	left: 20%;
+	width: 130px;
+	height: 80px;
+	right: 0px;
+	top: 5px;
+	/* background-color: purple; */
+}
+
+/* we are going to remove this label */
+.comms_priority_form label {
+	visibility: hidden;
+}
+
+.comms_priority_form select {
+	position: absolute;
+	top: 0px;
+	width: 125px;
+}
+
+.comms_priority_form input{
+	position: absolute;
+	bottom: 0px;
+	padding: 0px;
+	margin: 0px auto;
+}
+
+.comms_dedup_form {
+	position: absolute;
+	left:40%;
+    top: 5px;
+    border: 0px;
+	padding: 0px;
+	width: 130px;
+	/* background-color: red; */
+	right: 0px;
+	height: 80px;
+}
+
+/* we are going to remove this label */
+.comms_dedup_form label {
+	visibility: hidden;
+}
+
+/* we want to move this up */
+.comms_dedup_form select{
+	position: absolute;
+	top: 0px;
+	width: 125px;
+}
+
+/* we want to move this down */
+/* can we center this under neath the select? */
+.comms_dedup_form input{
+	position: absolute;
+	bottom: 0px;
+	padding: 0px;
+	margin: 0px auto;
+}
+
+
+/* this is the center section of the RGD container */
+.comms_groups_form {
+	position: absolute;
+	left:60%;
+	top:5px;
+    border: 0px;
+	padding: 0px;
+	width: 130px;
+	/* background-color: green; */
+	right: 0px;
+	height: 80px;
+}
+
+/* we are going to remove this label */
+.comms_groups_form label {
+	visibility: hidden;
+}
+
+/* we want to move this up */
+.comms_groups_form select{
+	position: absolute;
+	top: 0px;
+	width: 125px;
+}
+
+/* we want to move this down */
+/* can we center this under neath the select? */
+.comms_groups_form input{
+	position: absolute;
+	bottom: 0px;
+	padding: 0px;
+	margin: 0px auto;
+}
+
+/* this is a possible right most section of the RGD container */
+.gd_section {
+	position: absolute;
+	top: 5px;
+	right: 5px;
+	border: 0px;
+	padding: 0px;
+	width: 130px;
+	margin: 0px;
+	height: 80px;
+	overflow: auto;
+	/* background-color: blue; */
+}
+
+/* then we are going to hide the "add new comment link" */
+.comms .comment_add {
+	visibility: hidden;
+}
+
+.comms_groups_list label {
+	font-weight: bold;
+}
+
+.comms_dispatch_message label {
+	font-weight: bold;
+}
+
+.comms_sms_message label {
+	font-weight: bold;
+}
